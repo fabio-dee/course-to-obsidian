@@ -6,5 +6,6 @@ __pycache__/
 downloads/
 .env
 .env.*
+!.env.example
 .envrc
 .vault-notes/

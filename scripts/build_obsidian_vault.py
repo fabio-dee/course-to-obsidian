@@ -38,9 +38,39 @@ from typing import Any
 
 import yaml
 
+# Load .env from the repo root (two levels up from this file: scripts/build_obsidian_vault.py).
+# Non-fatal if python-dotenv isn't installed or .env is missing — env vars already set win either way.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
+except ImportError:
+    pass
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("", "0", "false", "no", "off")
+
+
 VAULT_SCHEMA = 1
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 SPARSE_INPUT_MIN_CHARS = 300   # below this, skip Haiku and derive metadata from path
+
+# ---- Local OpenAI-compatible LLM (llama.cpp / vLLM / LM Studio / Ollama-openai) ----
+LOCAL_LLM_BASE_URL = os.environ.get("LOCAL_LLM_BASE_URL", "").rstrip("/")
+LOCAL_LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "")
+LOCAL_LLM_API_KEY = os.environ.get("LOCAL_LLM_API_KEY", "not-needed")
+LOCAL_LLM_DISABLE_THINKING = _env_bool("LOCAL_LLM_DISABLE_THINKING", True)
+LOCAL_LLM_MAX_TOKENS = int(os.environ.get("LOCAL_LLM_MAX_TOKENS", "6000"))
+LOCAL_LLM_TEMPERATURE = float(os.environ.get("LOCAL_LLM_TEMPERATURE", "0.2"))
+LOCAL_LLM_TIMEOUT = float(os.environ.get("LOCAL_LLM_TIMEOUT", "900"))
+
+# ---- Canonicalization pass (--canonicalize) ----
+CANON_BACKEND = os.environ.get("CANON_BACKEND", "sdk")        # sdk|api|local
+CANON_MODEL = os.environ.get("CANON_MODEL", "claude-opus-4-7")
+CANON_API_BETA_1M = _env_bool("CANON_API_BETA_1M", False)     # opt-in 1M context header on --canon-backend api
 NAV_START = "<!-- vault:nav-start -->"
 NAV_END = "<!-- vault:nav-end -->"
 RELATED_START = "<!-- vault:related-start -->"
