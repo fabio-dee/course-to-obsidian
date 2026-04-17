@@ -12,12 +12,18 @@
 #   4. git init + gitignore + initial commit   (inside the vault, videos excluded)
 #
 # Env knobs:
-#   SKOOL_SKIP_DOWNLOAD=1   skip stage 1 (useful when scrape already done)
-#   SKOOL_SKIP_TRANSCRIBE=1 skip stage 2 (useful when re-running vault build only)
-#   SKOOL_SKIP_VAULT=1      skip stage 3
-#   SKOOL_SKIP_GIT=1        skip stage 4
-#   SKOOL_BACKEND=sdk|api   Haiku backend for stage 3 (default: sdk)
-#   SKOOL_VENV=path         python venv (default: .venv-transcribe-p312)
+#   SKOOL_SKIP_DOWNLOAD=1    skip stage 1 (useful when scrape already done)
+#   SKOOL_SKIP_TRANSCRIBE=1  skip stage 2 (useful when re-running vault build only)
+#   SKOOL_SKIP_VAULT=1       skip stage 3
+#   SKOOL_SKIP_GIT=1         skip stage 4
+#   SKOOL_BACKEND=sdk|api    Haiku backend for stage 3 (default: sdk)
+#   SKOOL_VENV=path          python venv; absolute or relative to $REPO
+#                            (default: $SKOOL_DOWNLOADER_DIR/.venv-transcribe-p312)
+#   SKOOL_DOWNLOADER_DIR     sibling path to the skool-downloader repo
+#                            (default: <parent-of-this-repo>/skool-downloader)
+#
+# Layout assumption: this repo (course-to-obsidian) and skool-downloader live as
+# siblings in a shared parent folder. Override with SKOOL_DOWNLOADER_DIR if not.
 
 set -Eeuo pipefail
 
@@ -34,18 +40,31 @@ fi
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$SCRIPT_DIR/.." && pwd)
-cd "$REPO"
 
-# Allow absolute or repo-relative SKOOL_VENV; default = <repo>/.venv-transcribe-p312
+# Locate the sibling skool-downloader repo (used for stage 1 + as default venv host).
+# Override via SKOOL_DOWNLOADER_DIR. Default: <wrapper>/skool-downloader where
+# <wrapper> is the parent of $REPO.
+DOWNLOADER_DIR=${SKOOL_DOWNLOADER_DIR:-$(cd "$REPO/.." && pwd)/skool-downloader}
+if [[ ! -d "$DOWNLOADER_DIR" ]]; then
+  err "skool-downloader not found at $DOWNLOADER_DIR"
+  err "set SKOOL_DOWNLOADER_DIR=/path/to/skool-downloader or place it as a sibling of $REPO"
+  exit 2
+fi
+
+# Allow absolute or repo-relative SKOOL_VENV; default falls back to the downloader's venv
+# (we intentionally share one venv across both repos — it already has parakeet-mlx + anthropic + etc).
 if [[ -n "${SKOOL_VENV:-}" && "${SKOOL_VENV:0:1}" == "/" ]]; then
   PY="$SKOOL_VENV/bin/python"
+elif [[ -n "${SKOOL_VENV:-}" ]]; then
+  PY="$REPO/$SKOOL_VENV/bin/python"
 else
-  VENV=${SKOOL_VENV:-.venv-transcribe-p312}
-  PY="$REPO/$VENV/bin/python"
+  PY="$DOWNLOADER_DIR/.venv-transcribe-p312/bin/python"
 fi
 if [[ ! -x "$PY" ]]; then
   err "python venv not found at $PY"
-  err "run: python3.12 -m venv $VENV && $VENV/bin/pip install -r scripts/transcribe_videos.requirements.txt anthropic pyyaml markdownify beautifulsoup4 claude-agent-sdk"
+  err "either point SKOOL_VENV at an existing venv, or create one:"
+  err "  python3.12 -m venv $DOWNLOADER_DIR/.venv-transcribe-p312"
+  err "  $DOWNLOADER_DIR/.venv-transcribe-p312/bin/pip install -r $REPO/scripts/transcribe_videos.requirements.txt anthropic pyyaml markdownify beautifulsoup4 claude-agent-sdk"
   exit 2
 fi
 
@@ -57,14 +76,15 @@ derive_slug() {
 }
 
 SLUG=${SLUG_OVERRIDE:-$(derive_slug "$URL")}
-VAULT="$REPO/downloads/$SLUG"
-log "slug:  $SLUG"
-log "vault: $VAULT"
+VAULT="$DOWNLOADER_DIR/downloads/$SLUG"
+log "slug:       $SLUG"
+log "downloader: $DOWNLOADER_DIR"
+log "vault:      $VAULT"
 
 # -------- 1. download --------
 if [[ -z "${SKOOL_SKIP_DOWNLOAD:-}" ]]; then
-  step "1/4  download via npm run skool"
-  npm run skool "$URL"
+  step "1/4  download via npm run skool (in $DOWNLOADER_DIR)"
+  (cd "$DOWNLOADER_DIR" && npm run skool "$URL")
 else
   log "skip stage 1 (SKOOL_SKIP_DOWNLOAD set)"
 fi
