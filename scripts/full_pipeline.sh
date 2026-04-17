@@ -36,8 +36,13 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$SCRIPT_DIR/.." && pwd)
 cd "$REPO"
 
-VENV=${SKOOL_VENV:-.venv-transcribe-p312}
-PY="$REPO/$VENV/bin/python"
+# Allow absolute or repo-relative SKOOL_VENV; default = <repo>/.venv-transcribe-p312
+if [[ -n "${SKOOL_VENV:-}" && "${SKOOL_VENV:0:1}" == "/" ]]; then
+  PY="$SKOOL_VENV/bin/python"
+else
+  VENV=${SKOOL_VENV:-.venv-transcribe-p312}
+  PY="$REPO/$VENV/bin/python"
+fi
 if [[ ! -x "$PY" ]]; then
   err "python venv not found at $PY"
   err "run: python3.12 -m venv $VENV && $VENV/bin/pip install -r scripts/transcribe_videos.requirements.txt anthropic pyyaml markdownify beautifulsoup4 claude-agent-sdk"

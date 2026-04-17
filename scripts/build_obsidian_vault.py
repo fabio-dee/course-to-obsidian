@@ -435,11 +435,12 @@ def _read_lesson_content(L: "Lesson") -> tuple[dict, str, str, list[tuple[str, s
         raw = L.transcript_path.read_text(encoding="utf-8")
         fm, body = parse_frontmatter(raw)
         body = strip_leading_h1(strip_nav_and_related(body)).strip()
-        # If this is a previously-rendered vault file, extract ONLY the transcript
-        # section so we don't duplicate notes/resources on re-run.
-        m = re.search(r"(?ms)^##\s+Transcript\s*\n+(.*?)(?=\n##\s|\n<!--\s*vault:|\Z)", body)
-        if m:
-            transcript_body = m.group(1).strip()
+        is_vault_file = fm.get("vault_schema") == VAULT_SCHEMA
+        if is_vault_file:
+            # Previously rendered by us: extract ONLY the transcript section.
+            # Missing section = no transcript existed at render time.
+            m = re.search(r"(?ms)^##\s+Transcript\s*\n+(.*?)(?=\n##\s|\n<!--\s*vault:|\Z)", body)
+            transcript_body = m.group(1).strip() if m else ""
         else:
             # Raw transcript.md: body may have a leading blockquote summary line from a prior partial render — strip it.
             transcript_body = re.sub(r"^\s*>\s.*\n+", "", body).strip()
