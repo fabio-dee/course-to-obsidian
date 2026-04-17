@@ -913,6 +913,293 @@ def git_init(vault_root: Path, dry_run: bool) -> None:
         print("  no changes to commit")
 
 
+# ---------- canonicalization ----------
+
+
+CANON_SYSTEM_PROMPT = """You are a knowledge-graph librarian. You receive the full inventory of tag and concept names used across a single vault of lesson notes, along with their occurrence counts. The vault is a freelancing / automation curriculum (cold email, Upwork, lead scraping, proposals, sales calls, n8n, Make.com, agentic workflows, mindset, retrospectives).
+
+Your job is to produce a canonicalization mapping that merges near-duplicates so the wikilink graph becomes coherent.
+
+Rules:
+- Merge trivial variants (case, plural, whitespace, adjective reordering, obvious synonyms) into ONE canonical spelling.
+- Merge concepts that describe the SAME underlying idea expressed differently (e.g. "Weekly Retrospective Cycle" / "Retrospective Framework" / "Retrospective Analysis Framework" -> "Weekly Retrospective Framework"). Use your judgment: merge aggressively when the ideas are the same; KEEP distinct when they're truly different topics even if the words overlap.
+- For tags, strongly prefer names from the curated vocabulary when a variant means the same thing: cold-email, upwork, lead-generation, scraping, proposals, sales-call, pricing, offer-design, n8n, make, agentic-workflows, mindset, retrospective, accountability, community, portfolio, positioning, infrastructure, tooling.
+- Canonical names should be the clearest, most self-descriptive spelling among the variants (use Title Case for concepts, kebab-case for tags).
+- The mapping MUST be idempotent: every canonical name must also map to itself.
+- Do not invent new names that aren't in the input.
+
+Return STRICT JSON, no prose, no code fences:
+{
+  "concepts": { "<variant>": "<canonical>", ... },
+  "tags":     { "<variant>": "<canonical>", ... },
+  "notes":    "<=400 chars, what merges you made and why"
+}
+"""
+
+
+def _collect_vault_inventory(vault_root: Path) -> tuple[dict[str, list[Path]], dict[str, int], dict[str, list[Path]], dict[str, int], list[Path]]:
+    """Walk the vault, parse frontmatter of every lesson file.
+
+    Returns (concept_to_paths, concept_counts, tag_to_paths, tag_counts, lesson_files).
+    A "lesson file" is any .md with vault_schema:1 in its frontmatter.
+    """
+    concept_paths: dict[str, list[Path]] = defaultdict(list)
+    tag_paths: dict[str, list[Path]] = defaultdict(list)
+    concept_counts: dict[str, int] = defaultdict(int)
+    tag_counts: dict[str, int] = defaultdict(int)
+    lesson_files: list[Path] = []
+    for p in vault_root.rglob("*.md"):
+        try:
+            text = p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        if not text.startswith("---\n"):
+            continue
+        fm, _body = parse_frontmatter(text)
+        if fm.get("vault_schema") != VAULT_SCHEMA:
+            continue
+        lesson_files.append(p)
+        for c in fm.get("concepts", []) or []:
+            c = str(c).strip()
+            if c:
+                concept_paths[c].append(p)
+                concept_counts[c] += 1
+        for t in fm.get("tags", []) or []:
+            t = str(t).strip()
+            if t:
+                tag_paths[t].append(p)
+                tag_counts[t] += 1
+    return concept_paths, concept_counts, tag_paths, tag_counts, lesson_files
+
+
+def _build_canon_prompt(concept_counts: dict[str, int], tag_counts: dict[str, int]) -> str:
+    concept_lines = [f"  {c!r}: {n}" for c, n in sorted(concept_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+    tag_lines = [f"  {t!r}: {n}" for t, n in sorted(tag_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+    return (
+        "VAULT CONCEPT INVENTORY (name: occurrences across lessons):\n"
+        + "\n".join(concept_lines)
+        + "\n\nVAULT TAG INVENTORY (name: occurrences across lessons):\n"
+        + "\n".join(tag_lines)
+        + "\n\nReturn the canonicalization mapping as specified in the system prompt."
+    )
+
+
+def _canon_call_sdk(user_msg: str) -> str:
+    import asyncio
+    from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, TextBlock
+
+    async def _run() -> str:
+        opts = ClaudeAgentOptions(
+            model=CANON_MODEL,
+            system_prompt=CANON_SYSTEM_PROMPT,
+            allowed_tools=[],
+            max_turns=1,
+        )
+        text = ""
+        async for msg in query(prompt=user_msg, options=opts):
+            if isinstance(msg, AssistantMessage):
+                for b in msg.content:
+                    if isinstance(b, TextBlock):
+                        text += b.text
+        return text
+
+    return asyncio.run(_run())
+
+
+def _canon_call_api(user_msg: str) -> str:
+    import anthropic
+    client = anthropic.Anthropic()
+    extra_headers = {}
+    if CANON_API_BETA_1M:
+        extra_headers["anthropic-beta"] = "context-1m-2025-08-07"
+    resp = client.messages.create(
+        model=CANON_MODEL,
+        max_tokens=8000,
+        system=CANON_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_msg}],
+        extra_headers=extra_headers or None,
+    )
+    return resp.content[0].text
+
+
+def _canon_call_local(user_msg: str) -> str:
+    import requests
+    if not LOCAL_LLM_BASE_URL or not LOCAL_LLM_MODEL:
+        raise RuntimeError("canon backend=local but LOCAL_LLM_BASE_URL / LOCAL_LLM_MODEL are not set")
+    payload: dict[str, Any] = {
+        "model": LOCAL_LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": CANON_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0.1,
+        "max_tokens": max(8000, LOCAL_LLM_MAX_TOKENS),
+    }
+    if LOCAL_LLM_DISABLE_THINKING:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    r = requests.post(f"{LOCAL_LLM_BASE_URL}/chat/completions", json=payload, timeout=LOCAL_LLM_TIMEOUT)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def _parse_canon_mapping(raw: str) -> dict:
+    t = raw.strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t)
+    t = re.sub(r"\s*```\s*$", "", t)
+    m = re.search(r"\{.*\}", t, re.DOTALL)
+    if m:
+        t = m.group(0)
+    data = json.loads(t)
+    out = {"concepts": {}, "tags": {}, "notes": str(data.get("notes", ""))[:600]}
+    for k in ("concepts", "tags"):
+        raw_map = data.get(k, {}) or {}
+        if not isinstance(raw_map, dict):
+            continue
+        for src, dst in raw_map.items():
+            src_s = str(src).strip()
+            dst_s = str(dst).strip()
+            if src_s and dst_s:
+                out[k][src_s] = dst_s
+    return out
+
+
+def _apply_canon_to_vault(lesson_files: list[Path], mapping: dict, dry_run: bool) -> dict[str, int]:
+    """Rewrite frontmatter of every lesson file using the mapping.
+
+    Returns a stats dict. Preserves body_sha so classification cache still hits.
+    """
+    cmap: dict[str, str] = mapping.get("concepts", {})
+    tmap: dict[str, str] = mapping.get("tags", {})
+    stats = {"files_changed": 0, "concept_replacements": 0, "tag_replacements": 0}
+    for p in lesson_files:
+        text = p.read_text(encoding="utf-8")
+        fm, body = parse_frontmatter(text)
+        if not fm:
+            continue
+        before_concepts = list(fm.get("concepts", []) or [])
+        before_tags = list(fm.get("tags", []) or [])
+        after_concepts: list[str] = []
+        after_tags: list[str] = []
+        for c in before_concepts:
+            c_s = str(c).strip()
+            mapped = cmap.get(c_s, c_s)
+            if mapped != c_s:
+                stats["concept_replacements"] += 1
+            if mapped and mapped not in after_concepts:
+                after_concepts.append(mapped)
+        for t in before_tags:
+            t_s = str(t).strip()
+            mapped = tmap.get(t_s, t_s)
+            if mapped != t_s:
+                stats["tag_replacements"] += 1
+            if mapped and mapped not in after_tags:
+                after_tags.append(mapped)
+        if after_concepts == before_concepts and after_tags == before_tags:
+            continue
+        fm["concepts"] = after_concepts
+        fm["tags"] = after_tags
+        new_text = dump_frontmatter(fm) + body
+        if dry_run:
+            stats["files_changed"] += 1
+            continue
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(new_text, encoding="utf-8")
+        tmp.replace(p)
+        stats["files_changed"] += 1
+    return stats
+
+
+def _canon_commit(vault_root: Path, backend_label: str, stats: dict, mapping_path: Path) -> None:
+    if not (vault_root / ".git").exists():
+        print("  vault is not a git repo — skipping auto-commit (changes are on disk)")
+        return
+    subprocess.run(["git", "add", "-A"], cwd=vault_root, check=True)
+    r = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=vault_root)
+    if r.returncode == 0:
+        print("  no changes to commit")
+        return
+    msg = (
+        f"vault: canonicalize tags + concepts ({backend_label})\n"
+        f"\n"
+        f"files changed: {stats['files_changed']}\n"
+        f"concept replacements: {stats['concept_replacements']}\n"
+        f"tag replacements: {stats['tag_replacements']}\n"
+        f"\n"
+        f"mapping: {mapping_path.name}"
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=vault@local", "-c", "user.name=vault",
+         "commit", "-q", "-m", msg],
+        cwd=vault_root, check=True,
+    )
+    print("  committed canonicalization snapshot")
+
+
+def run_canonicalize(vault_root: Path, backend: str, apply: bool) -> int:
+    print(f"canonicalize: vault={vault_root}  backend={backend}  model={CANON_MODEL}  apply={apply}")
+    concept_paths, concept_counts, tag_paths, tag_counts, lesson_files = _collect_vault_inventory(vault_root)
+    print(f"  scanned {len(lesson_files)} lessons")
+    print(f"  unique concepts: {len(concept_counts)} (total occurrences: {sum(concept_counts.values())})")
+    print(f"  unique tags:     {len(tag_counts)} (total occurrences: {sum(tag_counts.values())})")
+    if not lesson_files:
+        print("  no lessons found with vault_schema frontmatter; nothing to canonicalize", file=sys.stderr)
+        return 1
+
+    user_msg = _build_canon_prompt(concept_counts, tag_counts)
+    print(f"  prompt size: {len(user_msg)} chars")
+
+    print(f"  calling {backend} ({CANON_MODEL}) ...")
+    if backend == "sdk":
+        raw = _canon_call_sdk(user_msg)
+    elif backend == "api":
+        raw = _canon_call_api(user_msg)
+    elif backend == "local":
+        raw = _canon_call_local(user_msg)
+    else:
+        print(f"  unknown canon backend: {backend}", file=sys.stderr)
+        return 2
+    print(f"  response: {len(raw)} chars")
+
+    try:
+        mapping = _parse_canon_mapping(raw)
+    except Exception as e:
+        print(f"  failed to parse mapping: {e}", file=sys.stderr)
+        # dump raw so the user can inspect
+        dump = vault_root / ".vault-notes" / "canonicalize-raw.txt"
+        dump.parent.mkdir(parents=True, exist_ok=True)
+        dump.write_text(raw, encoding="utf-8")
+        print(f"  raw response saved to {dump}", file=sys.stderr)
+        return 3
+
+    # Report merges (src -> dst where dst != src)
+    concept_merges = {s: d for s, d in mapping["concepts"].items() if s != d}
+    tag_merges = {s: d for s, d in mapping["tags"].items() if s != d}
+    print(f"  proposed merges: {len(concept_merges)} concepts, {len(tag_merges)} tags")
+    if mapping.get("notes"):
+        print(f"  model notes: {mapping['notes']}")
+
+    # Always write the mapping artifact alongside the vault
+    notes_dir = vault_root / ".vault-notes"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    mapping_path = notes_dir / "canonicalize-mapping.json"
+    mapping_path.write_text(json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"  wrote mapping: {mapping_path}")
+
+    if not apply:
+        # Dry-run: report top merges and stop.
+        sample = list(concept_merges.items())[:12]
+        print("\n  sample concept merges (dry-run):")
+        for s, d in sample:
+            print(f"    {s!r} -> {d!r}")
+        print("  run again with --canon-apply to rewrite frontmatters and commit.")
+        return 0
+
+    stats = _apply_canon_to_vault(lesson_files, mapping, dry_run=False)
+    print(f"  applied: files_changed={stats['files_changed']} concept_replacements={stats['concept_replacements']} tag_replacements={stats['tag_replacements']}")
+    _canon_commit(vault_root, f"{backend}/{CANON_MODEL}", stats, mapping_path)
+    return 0
+
+
 # ---------- main ----------
 
 
@@ -933,12 +1220,23 @@ def main() -> int:
     ap.add_argument("--haiku-paths", default=",".join(DEFAULT_HAIKU_PATH_GLOBS),
                     help="Comma-separated fnmatch globs matched against course/module/title; used only by --backend hybrid")
     ap.add_argument("--git-init", action="store_true")
+    ap.add_argument("--canonicalize", action="store_true",
+                    help="Run a one-shot dedup pass on the existing vault — no re-classification. "
+                         "Sends the full tag+concept inventory to CANON_MODEL and applies the resulting mapping.")
+    ap.add_argument("--canon-apply", action="store_true",
+                    help="With --canonicalize: actually rewrite frontmatters + git commit. Without it: dry-run, print sample + write mapping JSON.")
+    ap.add_argument("--canon-backend", choices=["sdk", "api", "local"], default=None,
+                    help="Override CANON_BACKEND env for this run.")
     args = ap.parse_args()
 
     vault_root = args.root.resolve()
     if not vault_root.is_dir():
         print(f"not a dir: {vault_root}", file=sys.stderr)
         return 1
+
+    if args.canonicalize:
+        canon_backend = args.canon_backend or CANON_BACKEND
+        return run_canonicalize(vault_root, canon_backend, apply=args.canon_apply)
 
     # Resolve backend
     if args.no_ai:
