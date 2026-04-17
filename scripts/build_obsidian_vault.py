@@ -376,6 +376,93 @@ def haiku_classify_api(client, title: str, path_hint: str, body: str) -> dict:
                 return {"summary": "", "tags": [], "concepts": [], "aliases": []}
 
 
+# --- Local OpenAI-compatible path (llama.cpp / vLLM / LM Studio / Ollama-openai) ---
+
+def classify_local_api(title: str, path_hint: str, body: str) -> dict:
+    """Synchronous classify via a local /v1/chat/completions endpoint.
+
+    Safe to call from threads. Reads config from LOCAL_LLM_* env vars.
+    On thinking-capable models (Qwen3, QwQ, etc.) sets chat_template_kwargs to
+    disable <think> blocks when LOCAL_LLM_DISABLE_THINKING is truthy.
+    """
+    import requests
+    if not LOCAL_LLM_BASE_URL or not LOCAL_LLM_MODEL:
+        print(f"  local(cfg) LOCAL_LLM_BASE_URL/MODEL not set; returning empty for {title}", file=sys.stderr)
+        return {"summary": "", "tags": [], "concepts": [], "aliases": []}
+
+    user_msg = _build_user_msg(title, path_hint, body)
+    payload: dict[str, Any] = {
+        "model": LOCAL_LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": LOCAL_LLM_TEMPERATURE,
+        "max_tokens": LOCAL_LLM_MAX_TOKENS,
+    }
+    if LOCAL_LLM_DISABLE_THINKING:
+        # llama.cpp + vLLM both honor chat_template_kwargs.enable_thinking for Qwen3 family.
+        # Servers that don't recognize it ignore it (tested on llama.cpp b8605).
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+
+    headers = {"Content-Type": "application/json"}
+    if LOCAL_LLM_API_KEY and LOCAL_LLM_API_KEY != "not-needed":
+        headers["Authorization"] = f"Bearer {LOCAL_LLM_API_KEY}"
+
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                f"{LOCAL_LLM_BASE_URL}/chat/completions",
+                json=payload, headers=headers, timeout=LOCAL_LLM_TIMEOUT,
+            )
+            r.raise_for_status()
+            data = r.json()
+            msg = data["choices"][0]["message"]
+            raw = (msg.get("content") or "").strip()
+            if not raw:
+                # some thinking-model servers return content in reasoning_content when the
+                # answer block gets truncated — don't try to parse it, trigger a retry.
+                raise ValueError("empty content (model may have exhausted max_tokens on reasoning)")
+            return _parse_classification_text(raw)
+        except Exception as e:
+            if attempt == 2:
+                print(f"  local({LOCAL_LLM_MODEL}) failed ({e}) for {title}", file=sys.stderr)
+                return {"summary": "", "tags": [], "concepts": [], "aliases": []}
+
+
+# --- Hybrid routing ---
+
+# Default path globs that route to Haiku in hybrid mode: technical/tool-heavy lessons
+# where specific concept names (e.g. "Array Explosion And Collapse", "Hook Deck Rate Limiting")
+# empirically beat the local model's more generic output. Override via --haiku-paths.
+DEFAULT_HAIKU_PATH_GLOBS = ("Automation Tutorials/*", "*N8N*", "*n8n*")
+
+
+def _lesson_path_segments(L: "Lesson") -> list[str]:
+    parts = [L.course, L.sub_course or "", L.module_title, L.lesson_title]
+    return [p for p in parts if p]
+
+
+def pick_backend_for_lesson(L: "Lesson", mode: str, haiku_globs: tuple[str, ...]) -> str:
+    """Return which backend to use for this lesson: 'sdk' | 'api' | 'local' | 'none'.
+
+    `mode` is the user's backend choice (sdk, api, local, hybrid, none).
+    In hybrid mode, lessons whose course/module/title matches any glob go to Haiku
+    (sdk or api depending on env), the rest go to local.
+    """
+    if mode in ("sdk", "api", "local", "none"):
+        return mode
+    if mode == "hybrid":
+        import fnmatch
+        haystack = " / ".join(_lesson_path_segments(L))
+        for g in haiku_globs:
+            if fnmatch.fnmatch(haystack, f"*{g}*"):
+                # Prefer api when a key is available, else sdk (Max subscription via CLI).
+                return "api" if os.environ.get("ANTHROPIC_API_KEY") else "sdk"
+        return "local"
+    return mode  # fallthrough (shouldn't happen)
+
+
 # --- Claude Agent SDK path (uses Claude CLI / Max subscription, no API key) ---
 
 async def haiku_classify_sdk(title: str, path_hint: str, body: str) -> dict:
@@ -409,16 +496,32 @@ async def haiku_classify_sdk(title: str, path_hint: str, body: str) -> dict:
     return {"summary": "", "tags": [], "concepts": [], "aliases": []}
 
 
-async def run_sdk_enrichment(lessons: list["Lesson"], force: bool, concurrency: int) -> None:
-    """Populate L.ai for every lesson using the Agent SDK, respecting body_sha cache."""
+async def run_async_enrichment(
+    lessons: list["Lesson"],
+    force: bool,
+    mode: str,
+    sdk_concurrency: int,
+    local_concurrency: int,
+    haiku_globs: tuple[str, ...],
+) -> None:
+    """Populate L.ai for every lesson.
+
+    Async-driven dispatcher: each lesson is routed via `pick_backend_for_lesson`
+    to sdk (Claude CLI, async), api (Anthropic SDK, sync-in-thread), local
+    (OpenAI-compat, sync-in-thread) or none. Separate semaphores bound concurrency
+    per backend so the local GPU and the Claude CLI don't contend.
+    """
     import asyncio
-    sem = asyncio.Semaphore(concurrency)
+    sdk_sem = asyncio.Semaphore(sdk_concurrency)
+    local_sem = asyncio.Semaphore(local_concurrency)
+    api_client = None  # lazy init
     done = 0
     lock = asyncio.Lock()
     total = len(lessons)
+    backend_counts: dict[str, int] = defaultdict(int)
 
     async def _one(L: "Lesson") -> None:
-        nonlocal done
+        nonlocal done, api_client
         fm, transcript_body, html_body_md, _res, hash_input = _read_lesson_content(L)
         L.body_hash = sha256_short(hash_input)
         cached = (
@@ -433,16 +536,34 @@ async def run_sdk_enrichment(lessons: list["Lesson"], force: bool, concurrency: 
                 "concepts": list(fm.get("concepts", [])),
                 "aliases": list(fm.get("aliases", [])),
             }
+            backend_counts["cached"] += 1
         else:
             combined_len = len(html_body_md) + len(transcript_body)
             if combined_len < SPARSE_INPUT_MIN_CHARS:
                 L.ai = _derive_sparse_ai(L, len(_res))
+                backend_counts["sparse"] += 1
             else:
                 hint = f"{L.course}/{L.sub_course or L.module_title}"
                 ai_input = (("LESSON NOTES:\n" + html_body_md + "\n\n") if html_body_md else "") \
                            + (("TRANSCRIPT:\n" + transcript_body) if transcript_body else "")
-                async with sem:
-                    L.ai = await haiku_classify_sdk(L.lesson_title, hint, ai_input)
+                picked = pick_backend_for_lesson(L, mode, haiku_globs)
+                backend_counts[picked] += 1
+                if picked == "sdk":
+                    async with sdk_sem:
+                        L.ai = await haiku_classify_sdk(L.lesson_title, hint, ai_input)
+                elif picked == "local":
+                    async with local_sem:
+                        L.ai = await asyncio.to_thread(classify_local_api, L.lesson_title, hint, ai_input)
+                elif picked == "api":
+                    if api_client is None:
+                        api_client = make_api_client()
+                    # API calls run serially within this coroutine but many coroutines may run;
+                    # use sdk_sem as a shared cap to avoid hammering the endpoint.
+                    async with sdk_sem:
+                        L.ai = await asyncio.to_thread(haiku_classify_api, api_client, L.lesson_title, hint, ai_input)
+                else:  # "none"
+                    L.ai = {"summary": fm.get("summary", ""), "tags": list(fm.get("tags", [])),
+                            "concepts": list(fm.get("concepts", [])), "aliases": list(fm.get("aliases", []))}
         async with lock:
             done += 1
             if done % 10 == 0 or done == total:
@@ -452,6 +573,16 @@ async def run_sdk_enrichment(lessons: list["Lesson"], force: bool, concurrency: 
     errs = [r for r in results if isinstance(r, Exception)]
     if errs:
         print(f"  {len(errs)} task(s) raised (already retried internally); first: {errs[0]!r}", file=sys.stderr)
+    print("  backend routing: " + ", ".join(f"{k}={v}" for k, v in sorted(backend_counts.items())))
+
+
+# Back-compat shim: old name used elsewhere in this file.
+async def run_sdk_enrichment(lessons: list["Lesson"], force: bool, concurrency: int) -> None:
+    await run_async_enrichment(
+        lessons, force, mode="sdk",
+        sdk_concurrency=concurrency, local_concurrency=2,
+        haiku_globs=DEFAULT_HAIKU_PATH_GLOBS,
+    )
 
 
 # ---------- write ----------
@@ -792,10 +923,15 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--force", action="store_true", help="re-call Haiku even if body_sha matches")
     ap.add_argument("--no-ai", action="store_true", help="skip Haiku (structural pass only)")
-    ap.add_argument("--workers", type=int, default=8, help="API backend: ThreadPool workers")
-    ap.add_argument("--concurrency", type=int, default=4, help="SDK backend: concurrent CLI subprocesses")
-    ap.add_argument("--backend", choices=["auto", "sdk", "api"], default="auto",
-                    help="auto = use API if ANTHROPIC_API_KEY set, else SDK (Claude CLI/Max)")
+    ap.add_argument("--concurrency", type=int, default=4, help="Concurrent sdk/api calls")
+    ap.add_argument("--local-concurrency", type=int, default=2,
+                    help="Concurrent calls to the local LLM server (keep low on single-GPU hosts)")
+    ap.add_argument("--backend", choices=["auto", "sdk", "api", "local", "hybrid"], default="auto",
+                    help="auto = api if ANTHROPIC_API_KEY set, else sdk. "
+                         "local = OpenAI-compatible server (LOCAL_LLM_* env). "
+                         "hybrid = Haiku for technical paths (--haiku-paths), local for the rest.")
+    ap.add_argument("--haiku-paths", default=",".join(DEFAULT_HAIKU_PATH_GLOBS),
+                    help="Comma-separated fnmatch globs matched against course/module/title; used only by --backend hybrid")
     ap.add_argument("--git-init", action="store_true")
     args = ap.parse_args()
 
@@ -807,13 +943,12 @@ def main() -> int:
     # Resolve backend
     if args.no_ai:
         backend = "none"
-    elif args.backend == "sdk":
-        backend = "sdk"
-    elif args.backend == "api":
-        backend = "api"
-    else:  # auto
+    elif args.backend == "auto":
         backend = "api" if os.environ.get("ANTHROPIC_API_KEY") else "sdk"
+    else:
+        backend = args.backend
     print(f"backend: {backend}")
+    haiku_globs = tuple(g.strip() for g in args.haiku_paths.split(",") if g.strip())
 
     print(f"scanning {vault_root} ...")
     lessons = scan_lessons(vault_root)
@@ -826,24 +961,14 @@ def main() -> int:
 
     # Phase 1: enrich (AI) + compute new_path
     print("enriching transcripts ...")
-    if backend == "sdk":
-        import asyncio
-        # SDK path pre-populates L.ai + L.body_hash; then filename computation
-        # happens in a fast second pass (no_ai=True, already_tagged short-circuit).
-        asyncio.run(run_sdk_enrichment(lessons, args.force, args.concurrency))
-        for L in lessons:
-            _finalize_filename(L)
-    else:
-        client = make_api_client() if backend == "api" else None
-        no_ai = backend == "none"
-        done = 0
-        with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futs = [ex.submit(process_lesson, L, vault_root, client, no_ai, args.force, args.dry_run) for L in lessons]
-            for f in as_completed(futs):
-                f.result()
-                done += 1
-                if done % 25 == 0 or done == len(lessons):
-                    print(f"  {done}/{len(lessons)}")
+    import asyncio
+    asyncio.run(run_async_enrichment(
+        lessons, args.force, mode=backend,
+        sdk_concurrency=args.concurrency, local_concurrency=args.local_concurrency,
+        haiku_globs=haiku_globs,
+    ))
+    for L in lessons:
+        _finalize_filename(L)
 
     # Phase 2: MOCs (computes concept paths used by lesson rendering)
     print("writing MOCs ...")
