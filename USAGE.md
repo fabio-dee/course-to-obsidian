@@ -48,18 +48,34 @@ cd skool-downloader
 npx tsx src/cli.ts https://www.skool.com/<slug>/classroom
 ```
 
+### Bootstrap fingerprints on an existing vault (one-time, recommended before first `--update`)
+
+After updating to the multi-signal fingerprint scheme (Phase 5+), any vault scraped before this rolled out should be re-fingerprinted once. This is local-only — no Playwright, no network — and stamps `fp_schema: 2` so subsequent `--update` runs skip the slow lazy-rebuild path.
+
+```bash
+cd skool-downloader
+npx tsx src/cli.ts --refingerprint -o downloads/<local-folder>
+# Already-current lessons are skipped automatically.
+# Use --force-refingerprint to recompute everything (after a schema bump).
+```
+
 ### Check for new / updated lessons (re-download only what changed)
 
 ```bash
 cd skool-downloader
 npx tsx src/cli.ts https://www.skool.com/<slug>/classroom --update -o downloads/<local-folder>
+
+# If >30% of an existing vault is suddenly flagged NEW, the run aborts with
+# a report at <vault>/.update-aborted-<ts>.json. To bypass:
+#   add --force-update
 ```
 
 Examples:
 
 ```bash
-# Maker School
-npx tsx src/cli.ts https://www.skool.com/maker-school/classroom --update -o downloads/makerschool
+# Maker School (slug is `makerschool`, no hyphen — verify by opening the
+# classroom in your browser; the path segment after skool.com/ is the slug)
+npx tsx src/cli.ts https://www.skool.com/makerschool/classroom --update -o downloads/makerschool
 
 # Startup Empire
 npx tsx src/cli.ts https://www.skool.com/startupempire/classroom --update -o downloads/startupempire
