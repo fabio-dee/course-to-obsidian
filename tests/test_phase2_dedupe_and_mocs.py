@@ -115,12 +115,91 @@ def test_course_from_section_default_vs_off() -> None:
     print("PASS: --course-from-section toggles section vs vault_root.name")
 
 
+def test_orphan_section_level_moc_cleaned() -> None:
+    """Pre-consolidation builds wrote module MOCs at section level
+    (e.g. Month 1/_Day 3.md). The build should detect & remove these."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp).resolve() / "vault"
+        make_lesson(root / "Month 1" / "1-Day 1" / "01-a", "L1", "A", 1, 1, "Day 1")
+        # Plant a stale section-level MOC with module-moc frontmatter.
+        orphan = root / "Month 1" / "_Day 3.md"
+        orphan.parent.mkdir(parents=True, exist_ok=True)
+        orphan.write_text(
+            "---\nvault_schema: 1\ntitle: Day 3\ntype: module-moc\ncourse: Month 1\nmodule: Day 3\n---\n# Day 3\n",
+            encoding="utf-8",
+        )
+        r = run_script(str(root), "--no-ai")
+        assert r.returncode == 0, f"exit {r.returncode}\n{r.stderr}\n{r.stdout}"
+        assert not orphan.exists(), f"orphan section-level MOC was not removed: {orphan}"
+        # Sibling course MOC must NOT be removed (it lives at section level too).
+        course_moc = root / "Month 1" / "_Month 1.md"
+        assert course_moc.exists(), "course MOC erroneously removed"
+        assert "removed" in r.stdout, f"no removal message in stdout: {r.stdout}"
+    print("PASS: orphan section-level module-moc cleaned, course MOC preserved")
+
+
+def test_concept_stub_case_insensitive_dedupe() -> None:
+    """Two lessons with same concept in different casings must produce ONE
+    stub (first-seen casing wins) — prevents case-collision data loss on
+    case-insensitive filesystems (macOS/Windows)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp).resolve() / "vault"
+        # Lesson A uses "Simplicity As Value", Lesson B uses "Simplicity as Value".
+        # Write the pre-tagged note at the renamed location ("NN. Title.md") so the
+        # scanner picks it up as the existing transcript and --no-ai pulls concepts
+        # from frontmatter (instead of falling through to sparse derivation).
+        for lid, idx, name, concept in [
+            ("LA", 1, "A", "Simplicity As Value"),
+            ("LB", 2, "B", "Simplicity as Value"),
+        ]:
+            ldir = root / "Month 1" / "1-Day 1" / f"0{idx}-{name.lower()}"
+            ldir.mkdir(parents=True, exist_ok=True)
+            (ldir / "lesson.json").write_text(
+                json.dumps({
+                    "lessonId": lid, "title": name, "lessonIndex": idx,
+                    "moduleIndex": 1, "moduleTitle": "Day 1", "hasVideo": False,
+                }), encoding="utf-8")
+            # Fat body → bypasses sparse-derivation path; with backend=none the
+            # script falls through to the fm-based assignment (L586-587).
+            big = ("This is body content used to exceed the sparse input threshold. " * 10)
+            (ldir / "index.html").write_text(
+                f"<html><body><div class='content'><h1>{name}</h1><p>{big}</p></div></body></html>",
+                encoding="utf-8")
+            note = ldir / f"0{idx}. {name}.md"
+            note.write_text(
+                "---\n"
+                "vault_schema: 1\n"
+                f"title: {name}\n"
+                "course: Month 1\n"
+                "module: Day 1\n"
+                "module_index: 1\n"
+                f"lesson_index: {idx}\n"
+                f"lesson_id: {lid}\n"
+                "tags:\n- t\n"
+                f"concepts:\n- {concept}\n"
+                "summary: x\n"
+                "body_sha: deadbeef\n"
+                "---\n"
+                f"# {name}\n\n## Transcript\n\n{big}\n",
+                encoding="utf-8",
+            )
+        r = run_script(str(root), "--no-ai")
+        assert r.returncode == 0, f"exit {r.returncode}\n{r.stderr}\n{r.stdout}"
+        stubs = list((root / "Concepts").glob("Simplicity*Value*.md"))
+        assert len(stubs) == 1, f"expected exactly 1 stub, got {len(stubs)}: {[s.name for s in stubs]}"
+        # First-seen casing (lesson_index=1 = "Simplicity As Value") wins.
+        assert stubs[0].name == "Simplicity As Value.md", f"unexpected casing: {stubs[0].name}"
+    print("PASS: concept stub case-insensitive dedupe (first-seen casing wins)")
+
+
 if __name__ == "__main__":
     tests = [
         test_sanity_check_blocks_duplicated_vault,
         test_dedupe_skips_duplicate_lesson_id,
         test_day_moc_generation_and_auto_note,
         test_course_from_section_default_vs_off,
+        test_orphan_section_level_moc_cleaned,
+        test_concept_stub_case_insensitive_dedupe,
     ]
     failures = 0
     for t in tests:

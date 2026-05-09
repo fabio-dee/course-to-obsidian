@@ -164,6 +164,14 @@ def check_orphan_concepts(vault: Path):
     if not concepts_dir.is_dir():
         warn("no Concepts/ folder", "skip")
         return
+    # Concept names in fm are raw (e.g. "The 80/20 Principle"); stub filenames
+    # are produced via build_obsidian_vault.safe_filename which strips path-illegal
+    # chars (/, \, :, *, ?, ", <, >, |). Normalize fm names the same way before
+    # comparing — otherwise legit stubs look orphaned (false positive).
+    illegal = re.compile(r'[\\/:*?"<>|]')
+    def _normalize(name: str) -> str:
+        return illegal.sub("", str(name)).strip().lower()
+
     referenced: set[str] = set()
     for md, _ in iter_lesson_md(vault):
         try:
@@ -171,9 +179,9 @@ def check_orphan_concepts(vault: Path):
         except Exception:
             continue
         for c in fm.get("concepts", []) or []:
-            referenced.add(str(c).strip().lower())
+            referenced.add(_normalize(c))
     stubs = list(concepts_dir.glob("*.md"))
-    orphans = [s for s in stubs if s.stem.lower() not in referenced]
+    orphans = [s for s in stubs if _normalize(s.stem) not in referenced]
     if orphans:
         warn("orphan concept stubs", f"{len(orphans)}/{len(stubs)} stubs unreferenced (expected after canonicalization; consider cleanup)")
     else:
@@ -225,11 +233,16 @@ def check_body_wikilinks_to_canonicalized(vault: Path):
         mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
     except Exception as e:
         warn("mapping parse", str(e)); return
-    # Mapping keys are variants → canonical
+    # Mapping keys are variants → canonical. Exclude identity entries (k == v):
+    # those keys ARE the canonical, so a body wikilink to them is not a stale variant.
     concept_variants: set[str] = set()
     cmap = mapping.get("concepts", mapping) if isinstance(mapping, dict) else {}
     if isinstance(cmap, dict):
-        concept_variants = {str(k).strip().lower() for k in cmap.keys()}
+        concept_variants = {
+            str(k).strip().lower()
+            for k, v in cmap.items()
+            if str(k).strip().lower() != str(v).strip().lower()
+        }
     if not concept_variants:
         ok("no canonicalized concepts to check")
         return

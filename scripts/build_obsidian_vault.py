@@ -805,11 +805,16 @@ def write_mocs(lessons: list[Lesson], vault_root: Path, dry_run: bool) -> dict[s
     by_course: dict[str, list[Lesson]] = defaultdict(list)
     concepts: dict[str, list[Lesson]] = defaultdict(list)
 
+    # Case-insensitive concept dedupe: macOS/Windows have case-insensitive
+    # filesystems, so "Simplicity as X" and "Simplicity As X" would clobber
+    # each other when stubs are written. Collapse to the first-seen casing.
+    canonical_case: dict[str, str] = {}
     for L in lessons:
         by_module[(L.course, L.module_dir)].append(L)
         by_course[L.course].append(L)
         for c in L.ai.get("concepts", []):
-            concepts[c].append(L)
+            key = canonical_case.setdefault(c.lower(), c)
+            concepts[key].append(L)
 
     moc_files: list[tuple[Path, str]] = []
 
@@ -918,6 +923,40 @@ def write_mocs(lessons: list[Lesson], vault_root: Path, dry_run: bool) -> dict[s
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
     print(f"  wrote {len(moc_files)} MOC/concept files")
+
+    # Cleanup: remove orphan auto-generated MOCs left over from prior layouts
+    # (e.g. section-level "Month 1/_Day 3.md" stubs from pre-consolidation builds
+    # when vault_root pointed at the parent of "Maker School/"). We only remove
+    # files that carry the AUTO_NOTE marker AND aren't in the expected set, so
+    # hand-written MOCs are never touched.
+    expected = {p.resolve() for p, _ in moc_files}
+    removed = 0
+    for course in by_course.keys():
+        course_dir = vault_root / course
+        if not course_dir.is_dir():
+            continue
+        for f in course_dir.glob("_*.md"):
+            if f.resolve() in expected:
+                continue
+            try:
+                text = f.read_text(encoding="utf-8")
+                fm, _ = parse_frontmatter(text)
+                # Auto-managed MOCs carry either the AUTO_NOTE marker (newer builds)
+                # or a moc_type/type:module-moc frontmatter (older builds before
+                # AUTO_NOTE existed — these are the section-level orphans we want).
+                is_auto = (
+                    AUTO_NOTE in text
+                    or fm.get("moc_type") == "module"
+                    or fm.get("type") == "module-moc"
+                )
+                if is_auto:
+                    if not dry_run:
+                        f.unlink()
+                    removed += 1
+            except Exception:
+                pass
+    if removed:
+        print(f"  removed {removed} orphan auto-generated MOC(s) from prior layouts")
     return concept_paths
 
 
