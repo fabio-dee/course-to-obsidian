@@ -100,12 +100,55 @@ else
 fi
 
 # -------- 3. build vault --------
+# Capture pre-build baselines for the post-build guardrail (defends against
+# duplication bugs like the 26 GB vault doubling that silently shipped in
+# commit fa419b9). Only counts files that aren't inside .git/.
+vault_size_kb()  { du -sk "$1" 2>/dev/null | awk '{print $1}'; }
+vault_md_count() { find "$1" -name "*.md" -not -path "*/.git/*" 2>/dev/null | wc -l | tr -d ' '; }
+
+PRE_SIZE=$(vault_size_kb "$VAULT")
+PRE_COUNT=$(vault_md_count "$VAULT")
+log "pre-build baseline: ${PRE_SIZE} KB, ${PRE_COUNT} markdown files"
+
 if [[ -z "${SKOOL_SKIP_VAULT:-}" ]]; then
   step "3/4  build Obsidian vault (rename, frontmatter, MOCs, Haiku tags)"
   BACKEND=${SKOOL_BACKEND:-sdk}
   "$PY" "$REPO/scripts/build_obsidian_vault.py" "$VAULT" --backend "$BACKEND"
 else
   log "skip stage 3 (SKOOL_SKIP_VAULT set)"
+fi
+
+# -------- 3.5 sanity guardrail --------
+# Refuse to auto-commit if the vault grew >50% in either size or md-count
+# during stage 3. Skipped when the pre-build vault was empty (fresh scrape).
+POST_SIZE=$(vault_size_kb "$VAULT")
+POST_COUNT=$(vault_md_count "$VAULT")
+log "post-build state:    ${POST_SIZE} KB, ${POST_COUNT} markdown files"
+
+GROWTH_VIOLATION=0
+if [[ "${PRE_SIZE:-0}" -gt 0 ]]; then
+  if awk -v a="$PRE_SIZE" -v b="$POST_SIZE" 'BEGIN { exit !((b - a) / a > 0.5) }'; then
+    GROWTH_VIOLATION=1
+  fi
+fi
+if [[ "${PRE_COUNT:-0}" -gt 0 ]]; then
+  if awk -v a="$PRE_COUNT" -v b="$POST_COUNT" 'BEGIN { exit !((b - a) / a > 0.5) }'; then
+    GROWTH_VIOLATION=1
+  fi
+fi
+
+if [[ "$GROWTH_VIOLATION" -eq 1 ]]; then
+  err "================================================================"
+  err "❌ Vault doubled in size — likely duplication bug. NOT committing."
+  err "----------------------------------------------------------------"
+  err "  size  : ${PRE_SIZE} KB → ${POST_SIZE} KB  (>50% growth)"
+  err "  files : ${PRE_COUNT} → ${POST_COUNT} markdown files  (>50% growth)"
+  err "----------------------------------------------------------------"
+  err "Inspect ${VAULT} manually."
+  err "If the growth is intentional, run:"
+  err "  cd \"${VAULT}\" && git add -A && git commit"
+  err "================================================================"
+  exit 1
 fi
 
 # -------- 4. git init + commit --------
