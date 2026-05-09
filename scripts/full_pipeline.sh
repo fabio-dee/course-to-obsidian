@@ -151,6 +151,27 @@ if [[ "$GROWTH_VIOLATION" -eq 1 ]]; then
   exit 1
 fi
 
+# -------- 3.5  vault integrity gate --------
+INTEGRITY_SCRIPT="$(dirname "$0")/vault_integrity_check.py"
+if [[ -f "$INTEGRITY_SCRIPT" ]]; then
+  log "running vault_integrity_check..."
+  set +e
+  "$PY" "$INTEGRITY_SCRIPT" "$VAULT"
+  INTEGRITY_RC=$?
+  set -e
+  if [[ "$INTEGRITY_RC" -eq 2 ]]; then
+    err "================================================================"
+    err "❌ Integrity check FAILED. Refusing to commit."
+    err "Inspect ${VAULT} manually and re-run with SKOOL_SKIP_GIT to bypass."
+    err "================================================================"
+    exit 1
+  elif [[ "$INTEGRITY_RC" -eq 1 ]]; then
+    log "integrity check: WARN (non-fatal, continuing)"
+  else
+    log "integrity check: OK"
+  fi
+fi
+
 # -------- 4. git init + commit --------
 if [[ -z "${SKOOL_SKIP_GIT:-}" ]]; then
   step "4/4  git init + commit"
