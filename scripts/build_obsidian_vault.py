@@ -31,7 +31,6 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,6 +41,7 @@ import yaml
 # Non-fatal if python-dotenv isn't installed or .env is missing — env vars already set win either way.
 try:
     from dotenv import load_dotenv
+
     load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
 except ImportError:
     pass
@@ -56,7 +56,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 VAULT_SCHEMA = 1
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
-SPARSE_INPUT_MIN_CHARS = 300   # below this, skip Haiku and derive metadata from path
+SPARSE_INPUT_MIN_CHARS = 300  # below this, skip Haiku and derive metadata from path
 
 # ---- Local OpenAI-compatible LLM (llama.cpp / vLLM / LM Studio / Ollama-openai) ----
 LOCAL_LLM_BASE_URL = os.environ.get("LOCAL_LLM_BASE_URL", "").rstrip("/")
@@ -67,10 +67,25 @@ LOCAL_LLM_MAX_TOKENS = int(os.environ.get("LOCAL_LLM_MAX_TOKENS", "6000"))
 LOCAL_LLM_TEMPERATURE = float(os.environ.get("LOCAL_LLM_TEMPERATURE", "0.2"))
 LOCAL_LLM_TIMEOUT = float(os.environ.get("LOCAL_LLM_TIMEOUT", "900"))
 
+# ---- CLI fallback LLMs ----
+# Codex is useful as a local authenticated CLI fallback when Claude CLI / SDK is
+# unavailable (for example: `claude` logged out). It is intentionally opt-in via
+# backend choice or fallback list because it is usually slower/costlier than Haiku.
+CODEX_CLI = os.environ.get("CODEX_CLI", "codex")
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "")
+CODEX_CLI_TIMEOUT = float(os.environ.get("CODEX_CLI_TIMEOUT", "900"))
+AI_FALLBACK_BACKENDS = tuple(
+    b.strip()
+    for b in os.environ.get("AI_FALLBACK_BACKENDS", "codex").split(",")
+    if b.strip()
+)
+
 # ---- Canonicalization pass (--canonicalize) ----
-CANON_BACKEND = os.environ.get("CANON_BACKEND", "sdk")        # sdk|api|local
+CANON_BACKEND = os.environ.get("CANON_BACKEND", "sdk")  # sdk|api|local
 CANON_MODEL = os.environ.get("CANON_MODEL", "claude-opus-4-7")
-CANON_API_BETA_1M = _env_bool("CANON_API_BETA_1M", False)     # opt-in 1M context header on --canon-backend api
+CANON_API_BETA_1M = _env_bool(
+    "CANON_API_BETA_1M", False
+)  # opt-in 1M context header on --canon-backend api
 NAV_START = "<!-- vault:nav-start -->"
 NAV_END = "<!-- vault:nav-end -->"
 RELATED_START = "<!-- vault:related-start -->"
@@ -97,23 +112,23 @@ Rules:
 
 @dataclass
 class Lesson:
-    course: str                  # "Month 1", "Automation Tutorials", ...
-    sub_course: str | None       # e.g. "N8N Accelerator" for Automation Tutorials, else None
-    module_dir: str              # "2-Day 1"
-    module_title: str            # "Day 1"
+    course: str  # "Month 1", "Automation Tutorials", ...
+    sub_course: str | None  # e.g. "N8N Accelerator" for Automation Tutorials, else None
+    module_dir: str  # "2-Day 1"
+    module_title: str  # "Day 1"
     module_index: int
-    lesson_dir: Path             # absolute path to lesson folder
+    lesson_dir: Path  # absolute path to lesson folder
     lesson_index: int
-    lesson_title: str            # raw from lesson.json
+    lesson_title: str  # raw from lesson.json
     lesson_id: str
     transcript_path: Path | None  # None if no video / transcript available
     index_html_path: Path | None  # absolute path to index.html if present
     # computed
     has_video: bool = False
-    new_filename: str = ""       # e.g. "01. Choose operating name.md"
+    new_filename: str = ""  # e.g. "01. Choose operating name.md"
     new_path: Path = field(default=Path())
     body_hash: str = ""
-    ai: dict = field(default_factory=dict)   # {summary, tags, concepts, aliases}
+    ai: dict = field(default_factory=dict)  # {summary, tags, concepts, aliases}
     prev: "Lesson | None" = None
     next: "Lesson | None" = None
 
@@ -143,7 +158,11 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 
 
 def dump_frontmatter(fm: dict) -> str:
-    return "---\n" + yaml.safe_dump(fm, allow_unicode=True, sort_keys=False, width=1000) + "---\n"
+    return (
+        "---\n"
+        + yaml.safe_dump(fm, allow_unicode=True, sort_keys=False, width=1000)
+        + "---\n"
+    )
 
 
 def sha256_short(s: str) -> str:
@@ -183,6 +202,7 @@ def extract_html_lesson(path: Path) -> tuple[str, list[tuple[str, str]]]:
     """
     from bs4 import BeautifulSoup
     from markdownify import markdownify
+
     try:
         html = path.read_text(encoding="utf-8", errors="replace")
     except Exception:
@@ -192,7 +212,9 @@ def extract_html_lesson(path: Path) -> tuple[str, list[tuple[str, str]]]:
     body_md = ""
     if content:
         inner = str(content)
-        body_md = markdownify(inner, heading_style="ATX", strip=["style", "script"]).strip()
+        body_md = markdownify(
+            inner, heading_style="ATX", strip=["style", "script"]
+        ).strip()
         # markdownify keeps the wrapping div as nothing, and may produce excessive blank lines
         body_md = re.sub(r"\n{3,}", "\n\n", body_md)
     resources: list[tuple[str, str]] = []
@@ -221,8 +243,14 @@ def wikilink(path_from_vault: str, display: str | None = None) -> str:
 
 COURSE_ORDER = [
     "Pre-Program- Before You Start",
-    "Month 1", "Month 2", "Month 3", "Month 4", "Month 5", "Month 6",
-    "Automation Tutorials", "Resource Library",
+    "Month 1",
+    "Month 2",
+    "Month 3",
+    "Month 4",
+    "Month 5",
+    "Month 6",
+    "Automation Tutorials",
+    "Resource Library",
 ]
 
 
@@ -290,7 +318,7 @@ def scan_lessons(vault_root: Path, course_from_section: bool = True) -> list[Les
         #     (e.g. "Maker School") for vaults still nested under a single top-level folder.
         course = parts[0] if course_from_section else vault_root.name
         if parts[0] == "Automation Tutorials":
-            sub_course = parts[1]       # "2-N8N Accelerator"
+            sub_course = parts[1]  # "2-N8N Accelerator"
             module_dir = parts[1]
             module_title = meta.get("moduleTitle") or re.sub(r"^\d+-", "", sub_course)
             sub_course_clean = re.sub(r"^\d+-", "", sub_course)
@@ -299,27 +327,33 @@ def scan_lessons(vault_root: Path, course_from_section: bool = True) -> list[Les
             module_dir = parts[1]
             module_title = meta.get("moduleTitle") or re.sub(r"^\d+-", "", module_dir)
 
-        lessons.append(Lesson(
-            course=course,
-            sub_course=sub_course_clean,
-            module_dir=module_dir,
-            module_title=module_title,
-            module_index=int(meta.get("moduleIndex", 0)),
-            lesson_dir=lesson_dir,
-            lesson_index=int(meta.get("lessonIndex", 0)),
-            lesson_title=meta.get("title") or lesson_dir.name,
-            lesson_id=meta.get("lessonId", ""),
-            transcript_path=transcript,
-            index_html_path=idx_html if idx_html.exists() else None,
-            has_video=bool(meta.get("hasVideo")),
-        ))
+        lessons.append(
+            Lesson(
+                course=course,
+                sub_course=sub_course_clean,
+                module_dir=module_dir,
+                module_title=module_title,
+                module_index=int(meta.get("moduleIndex", 0)),
+                lesson_dir=lesson_dir,
+                lesson_index=int(meta.get("lessonIndex", 0)),
+                lesson_title=meta.get("title") or lesson_dir.name,
+                lesson_id=meta.get("lessonId", ""),
+                transcript_path=transcript,
+                index_html_path=idx_html if idx_html.exists() else None,
+                has_video=bool(meta.get("hasVideo")),
+            )
+        )
     return lessons
 
 
 def _find_existing_renamed(lesson_dir: Path) -> Path | None:
     """A prior run may have renamed transcript.md -> 'NN. Title.md'. Detect it."""
     for p in lesson_dir.glob("*.md"):
-        if p.name in ("transcript.md", "transcript.remote.md", "transcript.parakeet.md"):
+        if p.name in (
+            "transcript.md",
+            "transcript.remote.md",
+            "transcript.parakeet.md",
+        ):
             continue
         # Heuristic: starts with digits + '.' + space
         if re.match(r"^\d{2}\. ", p.name):
@@ -347,7 +381,9 @@ def link_neighbors(lessons: list[Lesson]) -> None:
 def _coerce_classification(data: dict) -> dict:
     return {
         "summary": str(data.get("summary", ""))[:200],
-        "tags": [str(t).strip().lower().replace(" ", "-") for t in data.get("tags", []) if t][:7],
+        "tags": [
+            str(t).strip().lower().replace(" ", "-") for t in data.get("tags", []) if t
+        ][:7],
         "concepts": [str(c).strip() for c in data.get("concepts", []) if c][:5],
         "aliases": [str(a).strip() for a in data.get("aliases", []) if a][:2],
     }
@@ -367,37 +403,54 @@ def _parse_classification_text(text: str) -> dict:
 
 def _build_user_msg(title: str, path_hint: str, body: str) -> str:
     max_chars = 16000
-    snippet = body if len(body) <= max_chars else body[:max_chars] + "\n\n[...truncated...]"
+    snippet = (
+        body if len(body) <= max_chars else body[:max_chars] + "\n\n[...truncated...]"
+    )
     return f"LESSON PATH: {path_hint}\nTITLE: {title}\n\nTRANSCRIPT:\n{snippet}"
 
 
 # --- Raw Anthropic API path (fast, requires ANTHROPIC_API_KEY) ---
 
+
 def make_api_client():
     import anthropic
+
     return anthropic.Anthropic()
 
 
 def haiku_classify_api(client, title: str, path_hint: str, body: str) -> dict:
     import anthropic
+
     user_msg = _build_user_msg(title, path_hint, body)
     for attempt in range(3):
         try:
             resp = client.messages.create(
                 model=HAIKU_MODEL,
                 max_tokens=400,
-                system=[{"type": "text", "text": SYSTEM_PROMPT,
-                         "cache_control": {"type": "ephemeral"}}],
+                system=[
+                    {
+                        "type": "text",
+                        "text": SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
                 messages=[{"role": "user", "content": user_msg}],
             )
             return _parse_classification_text(resp.content[0].text)
-        except (anthropic.APIError, json.JSONDecodeError, KeyError, IndexError, ValueError) as e:
+        except (
+            anthropic.APIError,
+            json.JSONDecodeError,
+            KeyError,
+            IndexError,
+            ValueError,
+        ) as e:
             if attempt == 2:
                 print(f"  haiku(api) failed ({e}) for {title}", file=sys.stderr)
                 return {"summary": "", "tags": [], "concepts": [], "aliases": []}
 
 
 # --- Local OpenAI-compatible path (llama.cpp / vLLM / LM Studio / Ollama-openai) ---
+
 
 def classify_local_api(title: str, path_hint: str, body: str) -> dict:
     """Synchronous classify via a local /v1/chat/completions endpoint.
@@ -407,8 +460,12 @@ def classify_local_api(title: str, path_hint: str, body: str) -> dict:
     disable <think> blocks when LOCAL_LLM_DISABLE_THINKING is truthy.
     """
     import requests
+
     if not LOCAL_LLM_BASE_URL or not LOCAL_LLM_MODEL:
-        print(f"  local(cfg) LOCAL_LLM_BASE_URL/MODEL not set; returning empty for {title}", file=sys.stderr)
+        print(
+            f"  local(cfg) LOCAL_LLM_BASE_URL/MODEL not set; returning empty for {title}",
+            file=sys.stderr,
+        )
         return {"summary": "", "tags": [], "concepts": [], "aliases": []}
 
     user_msg = _build_user_msg(title, path_hint, body)
@@ -434,7 +491,9 @@ def classify_local_api(title: str, path_hint: str, body: str) -> dict:
         try:
             r = requests.post(
                 f"{LOCAL_LLM_BASE_URL}/chat/completions",
-                json=payload, headers=headers, timeout=LOCAL_LLM_TIMEOUT,
+                json=payload,
+                headers=headers,
+                timeout=LOCAL_LLM_TIMEOUT,
             )
             r.raise_for_status()
             data = r.json()
@@ -443,11 +502,16 @@ def classify_local_api(title: str, path_hint: str, body: str) -> dict:
             if not raw:
                 # some thinking-model servers return content in reasoning_content when the
                 # answer block gets truncated — don't try to parse it, trigger a retry.
-                raise ValueError("empty content (model may have exhausted max_tokens on reasoning)")
+                raise ValueError(
+                    "empty content (model may have exhausted max_tokens on reasoning)"
+                )
             return _parse_classification_text(raw)
         except Exception as e:
             if attempt == 2:
-                print(f"  local({LOCAL_LLM_MODEL}) failed ({e}) for {title}", file=sys.stderr)
+                print(
+                    f"  local({LOCAL_LLM_MODEL}) failed ({e}) for {title}",
+                    file=sys.stderr,
+                )
                 return {"summary": "", "tags": [], "concepts": [], "aliases": []}
 
 
@@ -464,17 +528,20 @@ def _lesson_path_segments(L: "Lesson") -> list[str]:
     return [p for p in parts if p]
 
 
-def pick_backend_for_lesson(L: "Lesson", mode: str, haiku_globs: tuple[str, ...]) -> str:
-    """Return which backend to use for this lesson: 'sdk' | 'api' | 'local' | 'none'.
+def pick_backend_for_lesson(
+    L: "Lesson", mode: str, haiku_globs: tuple[str, ...]
+) -> str:
+    """Return which backend to use for this lesson.
 
-    `mode` is the user's backend choice (sdk, api, local, hybrid, none).
-    In hybrid mode, lessons whose course/module/title matches any glob go to Haiku
-    (sdk or api depending on env), the rest go to local.
+    Backends: sdk | api | local | codex | none. `mode` is the user's backend
+    choice. In hybrid mode, lessons whose course/module/title matches any glob
+    go to Haiku (sdk or api depending on env), the rest go to local.
     """
-    if mode in ("sdk", "api", "local", "none"):
+    if mode in ("sdk", "api", "local", "codex", "none"):
         return mode
     if mode == "hybrid":
         import fnmatch
+
         haystack = " / ".join(_lesson_path_segments(L))
         for g in haiku_globs:
             if fnmatch.fnmatch(haystack, f"*{g}*"):
@@ -484,11 +551,86 @@ def pick_backend_for_lesson(L: "Lesson", mode: str, haiku_globs: tuple[str, ...]
     return mode  # fallthrough (shouldn't happen)
 
 
+def _empty_ai() -> dict:
+    return {"summary": "", "tags": [], "concepts": [], "aliases": []}
+
+
+def _is_empty_ai(ai: dict | None) -> bool:
+    return (
+        not ai or not ai.get("summary") or not ai.get("tags") or not ai.get("concepts")
+    )
+
+
+# --- Codex CLI fallback path (uses Codex CLI auth, no Anthropic key) ---
+
+
+def classify_codex_cli(title: str, path_hint: str, body: str) -> dict:
+    """Synchronous classify via `codex exec`.
+
+    This is a fallback for when Claude CLI / Agent SDK is unavailable. It writes
+    Codex's final answer to a temp file and parses that file as strict JSON.
+    """
+    import tempfile
+
+    user_msg = _build_user_msg(title, path_hint, body)
+    prompt = (
+        "You are a strict JSON classification function. Follow this system prompt exactly.\n\n"
+        f"SYSTEM PROMPT:\n{SYSTEM_PROMPT}\n\n"
+        "Return only the JSON object, with no Markdown fences and no prose.\n\n"
+        f"USER INPUT:\n{user_msg}"
+    )
+
+    with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as tmp:
+        output_path = tmp.name
+
+    cmd = [
+        CODEX_CLI,
+        "exec",
+        "-",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "--output-last-message",
+        output_path,
+    ]
+    if CODEX_MODEL:
+        cmd.extend(["--model", CODEX_MODEL])
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=prompt,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=CODEX_CLI_TIMEOUT,
+            check=False,
+        )
+        raw = Path(output_path).read_text(encoding="utf-8", errors="ignore").strip()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                (proc.stderr or "").strip() or f"codex exited {proc.returncode}"
+            )
+        if not raw:
+            raise ValueError("empty response from codex")
+        return _parse_classification_text(raw)
+    except Exception as e:
+        print(f"  codex(cli) failed ({e}) for {title}", file=sys.stderr)
+        return _empty_ai()
+    finally:
+        try:
+            Path(output_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 # --- Claude Agent SDK path (uses Claude CLI / Max subscription, no API key) ---
+
 
 async def haiku_classify_sdk(title: str, path_hint: str, body: str) -> dict:
     import asyncio
     from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, TextBlock
+
     opts = ClaudeAgentOptions(
         model=HAIKU_MODEL,
         system_prompt=SYSTEM_PROMPT,
@@ -508,13 +650,15 @@ async def haiku_classify_sdk(title: str, path_hint: str, body: str) -> dict:
             if not text.strip():
                 raise ValueError("empty response from CLI")
             return _parse_classification_text(text)
-        except Exception as e:          # SDK raises bare Exception on CLI exit!=0
+        except Exception as e:  # SDK raises bare Exception on CLI exit!=0
             last_err = e
             if attempt < 4:
-                await asyncio.sleep(2 ** attempt + (attempt * 0.3))  # 1, 2.3, 4.6, 9.9 s
+                await asyncio.sleep(2**attempt + (attempt * 0.3))  # 1, 2.3, 4.6, 9.9 s
                 continue
-    print(f"  haiku(sdk) gave up after 5 tries ({last_err}) for {title}", file=sys.stderr)
-    return {"summary": "", "tags": [], "concepts": [], "aliases": []}
+    print(
+        f"  haiku(sdk) gave up after 5 tries ({last_err}) for {title}", file=sys.stderr
+    )
+    return _empty_ai()
 
 
 async def run_async_enrichment(
@@ -533,6 +677,7 @@ async def run_async_enrichment(
     per backend so the local GPU and the Claude CLI don't contend.
     """
     import asyncio
+
     sdk_sem = asyncio.Semaphore(sdk_concurrency)
     local_sem = asyncio.Semaphore(local_concurrency)
     api_client = None  # lazy init
@@ -565,26 +710,82 @@ async def run_async_enrichment(
                 backend_counts["sparse"] += 1
             else:
                 hint = f"{L.course}/{L.sub_course or L.module_title}"
-                ai_input = (("LESSON NOTES:\n" + html_body_md + "\n\n") if html_body_md else "") \
-                           + (("TRANSCRIPT:\n" + transcript_body) if transcript_body else "")
+                ai_input = (
+                    ("LESSON NOTES:\n" + html_body_md + "\n\n") if html_body_md else ""
+                ) + (("TRANSCRIPT:\n" + transcript_body) if transcript_body else "")
                 picked = pick_backend_for_lesson(L, mode, haiku_globs)
                 backend_counts[picked] += 1
                 if picked == "sdk":
                     async with sdk_sem:
                         L.ai = await haiku_classify_sdk(L.lesson_title, hint, ai_input)
+                    if _is_empty_ai(L.ai):
+                        for fallback in AI_FALLBACK_BACKENDS:
+                            if fallback == "codex":
+                                backend_counts["fallback:codex"] += 1
+                                async with sdk_sem:
+                                    L.ai = await asyncio.to_thread(
+                                        classify_codex_cli,
+                                        L.lesson_title,
+                                        hint,
+                                        ai_input,
+                                    )
+                            elif fallback == "local":
+                                backend_counts["fallback:local"] += 1
+                                async with local_sem:
+                                    L.ai = await asyncio.to_thread(
+                                        classify_local_api,
+                                        L.lesson_title,
+                                        hint,
+                                        ai_input,
+                                    )
+                            elif fallback == "api" and os.environ.get(
+                                "ANTHROPIC_API_KEY"
+                            ):
+                                backend_counts["fallback:api"] += 1
+                                if api_client is None:
+                                    api_client = make_api_client()
+                                async with sdk_sem:
+                                    L.ai = await asyncio.to_thread(
+                                        haiku_classify_api,
+                                        api_client,
+                                        L.lesson_title,
+                                        hint,
+                                        ai_input,
+                                    )
+                            if not _is_empty_ai(L.ai):
+                                break
+                elif picked == "codex":
+                    async with sdk_sem:
+                        L.ai = await asyncio.to_thread(
+                            classify_codex_cli, L.lesson_title, hint, ai_input
+                        )
                 elif picked == "local":
                     async with local_sem:
-                        L.ai = await asyncio.to_thread(classify_local_api, L.lesson_title, hint, ai_input)
+                        L.ai = await asyncio.to_thread(
+                            classify_local_api, L.lesson_title, hint, ai_input
+                        )
                 elif picked == "api":
                     if api_client is None:
                         api_client = make_api_client()
                     # API calls run serially within this coroutine but many coroutines may run;
                     # use sdk_sem as a shared cap to avoid hammering the endpoint.
                     async with sdk_sem:
-                        L.ai = await asyncio.to_thread(haiku_classify_api, api_client, L.lesson_title, hint, ai_input)
+                        L.ai = await asyncio.to_thread(
+                            haiku_classify_api,
+                            api_client,
+                            L.lesson_title,
+                            hint,
+                            ai_input,
+                        )
                 else:  # "none"
-                    L.ai = {"summary": fm.get("summary", ""), "tags": list(fm.get("tags", [])),
-                            "concepts": list(fm.get("concepts", [])), "aliases": list(fm.get("aliases", []))}
+                    L.ai = {
+                        "summary": fm.get("summary", ""),
+                        "tags": list(fm.get("tags", [])),
+                        "concepts": list(fm.get("concepts", [])),
+                        "aliases": list(fm.get("aliases", [])),
+                    }
+                if _is_empty_ai(L.ai) and picked != "none":
+                    backend_counts["empty-ai"] += 1
         async with lock:
             done += 1
             if done % 10 == 0 or done == total:
@@ -593,15 +794,26 @@ async def run_async_enrichment(
     results = await asyncio.gather(*[_one(L) for L in lessons], return_exceptions=True)
     errs = [r for r in results if isinstance(r, Exception)]
     if errs:
-        print(f"  {len(errs)} task(s) raised (already retried internally); first: {errs[0]!r}", file=sys.stderr)
-    print("  backend routing: " + ", ".join(f"{k}={v}" for k, v in sorted(backend_counts.items())))
+        print(
+            f"  {len(errs)} task(s) raised (already retried internally); first: {errs[0]!r}",
+            file=sys.stderr,
+        )
+    print(
+        "  backend routing: "
+        + ", ".join(f"{k}={v}" for k, v in sorted(backend_counts.items()))
+    )
 
 
 # Back-compat shim: old name used elsewhere in this file.
-async def run_sdk_enrichment(lessons: list["Lesson"], force: bool, concurrency: int) -> None:
+async def run_sdk_enrichment(
+    lessons: list["Lesson"], force: bool, concurrency: int
+) -> None:
     await run_async_enrichment(
-        lessons, force, mode="sdk",
-        sdk_concurrency=concurrency, local_concurrency=2,
+        lessons,
+        force,
+        mode="sdk",
+        sdk_concurrency=concurrency,
+        local_concurrency=2,
         haiku_globs=DEFAULT_HAIKU_PATH_GLOBS,
     )
 
@@ -609,7 +821,9 @@ async def run_sdk_enrichment(lessons: list["Lesson"], force: bool, concurrency: 
 # ---------- write ----------
 
 
-def _read_lesson_content(L: "Lesson") -> tuple[dict, str, str, list[tuple[str, str]], str]:
+def _read_lesson_content(
+    L: "Lesson",
+) -> tuple[dict, str, str, list[tuple[str, str]], str]:
     """Read all lesson sources. Returns (transcript_frontmatter, transcript_body, html_body_md, resources, hash_input)."""
     fm: dict = {}
     transcript_body = ""
@@ -621,7 +835,9 @@ def _read_lesson_content(L: "Lesson") -> tuple[dict, str, str, list[tuple[str, s
         if is_vault_file:
             # Previously rendered by us: extract ONLY the transcript section.
             # Missing section = no transcript existed at render time.
-            m = re.search(r"(?ms)^##\s+Transcript\s*\n+(.*?)(?=\n##\s|\n<!--\s*vault:|\Z)", body)
+            m = re.search(
+                r"(?ms)^##\s+Transcript\s*\n+(.*?)(?=\n##\s|\n<!--\s*vault:|\Z)", body
+            )
             transcript_body = m.group(1).strip() if m else ""
         else:
             # Raw transcript.md: body may have a leading blockquote summary line from a prior partial render — strip it.
@@ -645,29 +861,46 @@ def _derive_sparse_ai(L: "Lesson", n_resources: int) -> dict:
     (e.g. resource-only blueprints). Keeps MOCs linkable without blocking on Haiku."""
     ctx = f"{L.course} {L.sub_course or ''} {L.module_title}".lower()
     tags: list[str] = []
-    if "n8n" in ctx: tags.append("n8n")
-    if "make" in ctx: tags.append("make")
-    if "agentic" in ctx: tags.append("agentic-workflows")
-    if "community" in ctx or "call" in ctx: tags.append("community-call")
-    if "template" in ctx or "blueprint" in ctx: tags.append("template")
-    if "resource" in ctx or "library" in ctx: tags.append("resource")
-    if "niche" in ctx or "pack" in ctx: tags.append("niche-pack")
-    if "sales" in ctx: tags.append("sales-training")
-    if "vibe" in ctx or "coding" in ctx: tags.append("vibe-coding")
+    if "n8n" in ctx:
+        tags.append("n8n")
+    if "make" in ctx:
+        tags.append("make")
+    if "agentic" in ctx:
+        tags.append("agentic-workflows")
+    if "community" in ctx or "call" in ctx:
+        tags.append("community-call")
+    if "template" in ctx or "blueprint" in ctx:
+        tags.append("template")
+    if "resource" in ctx or "library" in ctx:
+        tags.append("resource")
+    if "niche" in ctx or "pack" in ctx:
+        tags.append("niche-pack")
+    if "sales" in ctx:
+        tags.append("sales-training")
+    if "vibe" in ctx or "coding" in ctx:
+        tags.append("vibe-coding")
     tags.append("reference")
     # Deduplicate while preserving order
     tags = list(dict.fromkeys(tags))[:5]
 
     concept = L.module_title.strip().strip(":").strip() or L.course
     # Prefer a more specific concept for known shapes
-    if "blueprint" in ctx: concept = "N8N Blueprint Library"
-    elif "niche" in ctx and "pack" in ctx: concept = "Niche Packs"
-    elif "community" in ctx and "exclusive" in ctx: concept = "Community Exclusives"
-    elif "community" in ctx and "call" in ctx: concept = "Community Calls"
+    if "blueprint" in ctx:
+        concept = "N8N Blueprint Library"
+    elif "niche" in ctx and "pack" in ctx:
+        concept = "Niche Packs"
+    elif "community" in ctx and "exclusive" in ctx:
+        concept = "Community Exclusives"
+    elif "community" in ctx and "call" in ctx:
+        concept = "Community Calls"
 
     summary = f"Reference entry in {L.course} › {L.module_title}."
     if n_resources:
-        summary += f" Includes {n_resources} downloadable resource" + ("s" if n_resources != 1 else "") + "."
+        summary += (
+            f" Includes {n_resources} downloadable resource"
+            + ("s" if n_resources != 1 else "")
+            + "."
+        )
     return {
         "summary": summary[:200],
         "tags": tags,
@@ -683,7 +916,9 @@ def _finalize_filename(L: "Lesson") -> None:
     L.new_path = L.lesson_dir / L.new_filename
 
 
-def process_lesson(L: Lesson, vault_root: Path, client, no_ai: bool, force: bool, dry_run: bool) -> None:
+def process_lesson(
+    L: Lesson, vault_root: Path, client, no_ai: bool, force: bool, dry_run: bool
+) -> None:
     fm, transcript_body, html_body_md, _resources, hash_input = _read_lesson_content(L)
     L.body_hash = sha256_short(hash_input)
 
@@ -694,25 +929,32 @@ def process_lesson(L: Lesson, vault_root: Path, client, no_ai: bool, force: bool
         and fm.get("concepts") is not None
     )
     if already_tagged and not force:
-        L.ai = {k: list(fm.get(k, [])) if k != "summary" else fm.get(k, "")
-                for k in ("summary", "tags", "concepts", "aliases")}
+        L.ai = {
+            k: list(fm.get(k, [])) if k != "summary" else fm.get(k, "")
+            for k in ("summary", "tags", "concepts", "aliases")
+        }
     elif no_ai:
-        L.ai = {k: list(fm.get(k, [])) if k != "summary" else fm.get(k, "")
-                for k in ("summary", "tags", "concepts", "aliases")}
+        L.ai = {
+            k: list(fm.get(k, [])) if k != "summary" else fm.get(k, "")
+            for k in ("summary", "tags", "concepts", "aliases")
+        }
     else:
         combined_len = len(html_body_md) + len(transcript_body)
         if combined_len < SPARSE_INPUT_MIN_CHARS:
             L.ai = _derive_sparse_ai(L, len(_resources))
         else:
             hint = f"{L.course}/{L.sub_course or L.module_title}"
-            ai_input = (("LESSON NOTES:\n" + html_body_md + "\n\n") if html_body_md else "") \
-                       + (("TRANSCRIPT:\n" + transcript_body) if transcript_body else "")
+            ai_input = (
+                ("LESSON NOTES:\n" + html_body_md + "\n\n") if html_body_md else ""
+            ) + (("TRANSCRIPT:\n" + transcript_body) if transcript_body else "")
             L.ai = haiku_classify_api(client, L.lesson_title, hint, ai_input)
 
     _finalize_filename(L)
 
 
-def render_lesson(L: Lesson, vault_root: Path, concept_paths: dict[str, Path]) -> tuple[Path, str]:
+def render_lesson(
+    L: Lesson, vault_root: Path, concept_paths: dict[str, Path]
+) -> tuple[Path, str]:
     fm, transcript_body, html_body_md, resources, _hash_input = _read_lesson_content(L)
     title_display = clean_title(L.lesson_title)
 
@@ -733,7 +975,14 @@ def render_lesson(L: Lesson, vault_root: Path, concept_paths: dict[str, Path]) -
         "body_sha": L.body_hash,
     }
     # carry forward transcription provenance if present
-    for k in ("source", "transcribed_at", "model", "language", "duration_sec", "word_count"):
+    for k in (
+        "source",
+        "transcribed_at",
+        "model",
+        "language",
+        "duration_sec",
+        "word_count",
+    ):
         if k in fm:
             new_fm[k] = fm[k]
 
@@ -742,7 +991,11 @@ def render_lesson(L: Lesson, vault_root: Path, concept_paths: dict[str, Path]) -
         rel = (o.lesson_dir / o.new_filename).relative_to(vault_root).as_posix()
         return wikilink(rel, f"{o.lesson_index:02d}. {clean_title(o.lesson_title)}")
 
-    module_moc_rel = (L.lesson_dir.parent / f"_{safe_filename(L.module_title)}.md").relative_to(vault_root).as_posix()
+    module_moc_rel = (
+        (L.lesson_dir.parent / f"_{safe_filename(L.module_title)}.md")
+        .relative_to(vault_root)
+        .as_posix()
+    )
     nav_parts = []
     if L.prev:
         nav_parts.append(f"← {link_lesson(L.prev)}")
@@ -799,7 +1052,9 @@ def render_lesson(L: Lesson, vault_root: Path, concept_paths: dict[str, Path]) -
 # ---------- MOCs ----------
 
 
-def write_mocs(lessons: list[Lesson], vault_root: Path, dry_run: bool) -> dict[str, Path]:
+def write_mocs(
+    lessons: list[Lesson], vault_root: Path, dry_run: bool
+) -> dict[str, Path]:
     # group
     by_module: dict[tuple[str, str], list[Lesson]] = defaultdict(list)
     by_course: dict[str, list[Lesson]] = defaultdict(list)
@@ -824,7 +1079,9 @@ def write_mocs(lessons: list[Lesson], vault_root: Path, dry_run: bool) -> dict[s
     for (course, module_dir), ls in by_module.items():
         ls_sorted = sorted(ls, key=lambda x: (x.lesson_index, x.lesson_title))
         module_title = ls_sorted[0].module_title
-        moc_path = vault_root / course / module_dir / f"_{safe_filename(module_title)}.md"
+        moc_path = (
+            vault_root / course / module_dir / f"_{safe_filename(module_title)}.md"
+        )
         lines = [
             AUTO_NOTE,
             "",
@@ -834,18 +1091,22 @@ def write_mocs(lessons: list[Lesson], vault_root: Path, dry_run: bool) -> dict[s
         ]
         for L in ls_sorted:
             rel = (L.new_path).relative_to(vault_root).as_posix()
-            lines.append(f"- {wikilink(rel, f'{L.lesson_index:02d}. {clean_title(L.lesson_title)}')}")
+            lines.append(
+                f"- {wikilink(rel, f'{L.lesson_index:02d}. {clean_title(L.lesson_title)}')}"
+            )
             if L.ai.get("summary"):
                 lines.append(f"    - {L.ai['summary']}")
         fm = {
             "vault_schema": VAULT_SCHEMA,
             "title": module_title,
-            "type": "module-moc",      # legacy key (back-compat with existing readers)
-            "moc_type": "module",      # new canonical key
+            "type": "module-moc",  # legacy key (back-compat with existing readers)
+            "moc_type": "module",  # new canonical key
             "course": course,
             "module": module_title,
         }
-        moc_files.append((moc_path, dump_frontmatter(fm) + "\n" + "\n".join(lines) + "\n"))
+        moc_files.append(
+            (moc_path, dump_frontmatter(fm) + "\n" + "\n".join(lines) + "\n")
+        )
 
     # Filesystem sweep: emit a stub MOC for every module folder that has NO scanned
     # lessons (ensures Day folders never silently lose their MOC, e.g. video-less days).
@@ -874,24 +1135,49 @@ def write_mocs(lessons: list[Lesson], vault_root: Path, dry_run: bool) -> dict[s
                 "course": course,
                 "module": module_title,
             }
-            moc_files.append((moc_path, dump_frontmatter(fm) + "\n" + "\n".join(lines) + "\n"))
+            moc_files.append(
+                (moc_path, dump_frontmatter(fm) + "\n" + "\n".join(lines) + "\n")
+            )
 
     # Course MOCs
     for course, ls in by_course.items():
         moc_path = vault_root / course / f"_{safe_filename(course)}.md"
         modules = sorted({(L.module_index, L.module_dir, L.module_title) for L in ls})
-        lines = [f"# {course}\n", f"> [[Maker School]] › **{course}**\n", "## Modules\n"]
+        lines = [
+            f"# {course}\n",
+            f"> [[Maker School]] › **{course}**\n",
+            "## Modules\n",
+        ]
         for _, mdir, mtitle in modules:
-            mrel = (vault_root / course / mdir / f"_{safe_filename(mtitle)}.md").relative_to(vault_root).as_posix()
+            mrel = (
+                (vault_root / course / mdir / f"_{safe_filename(mtitle)}.md")
+                .relative_to(vault_root)
+                .as_posix()
+            )
             lines.append(f"- {wikilink(mrel, mtitle)}")
-        fm = {"vault_schema": VAULT_SCHEMA, "title": course, "type": "course-moc", "course": course}
-        moc_files.append((moc_path, dump_frontmatter(fm) + "\n" + "\n".join(lines) + "\n"))
+        fm = {
+            "vault_schema": VAULT_SCHEMA,
+            "title": course,
+            "type": "course-moc",
+            "course": course,
+        }
+        moc_files.append(
+            (moc_path, dump_frontmatter(fm) + "\n" + "\n".join(lines) + "\n")
+        )
 
     # Root MOC
     root_path = vault_root / "Maker School.md"
-    lines = ["# Maker School\n", "> Root of the vault. Each course section is a MOC.\n", "## Sections\n"]
+    lines = [
+        "# Maker School\n",
+        "> Root of the vault. Each course section is a MOC.\n",
+        "## Sections\n",
+    ]
     for course in sorted(by_course.keys(), key=course_sort_key):
-        crel = (vault_root / course / f"_{safe_filename(course)}.md").relative_to(vault_root).as_posix()
+        crel = (
+            (vault_root / course / f"_{safe_filename(course)}.md")
+            .relative_to(vault_root)
+            .as_posix()
+        )
         lines.append(f"- {wikilink(crel, course)}")
     lines.append("\n## Concepts\n")
     for c in sorted(concepts.keys()):
@@ -907,14 +1193,25 @@ def write_mocs(lessons: list[Lesson], vault_root: Path, dry_run: bool) -> dict[s
         cpath = concepts_dir / f"{safe_filename(c)}.md"
         concept_paths[c] = cpath
         ls_sorted = sorted(ls, key=lambda L: (L.course, L.module_index, L.lesson_index))
-        lines = [f"# {c}\n",
-                 f"> Concept referenced in {len(ls)} lesson" + ("s" if len(ls) != 1 else "") + ".\n",
-                 "## Lessons\n"]
+        lines = [
+            f"# {c}\n",
+            f"> Concept referenced in {len(ls)} lesson"
+            + ("s" if len(ls) != 1 else "")
+            + ".\n",
+            "## Lessons\n",
+        ]
         for L in ls_sorted:
             rel = L.new_path.relative_to(vault_root).as_posix()
-            lines.append(f"- {wikilink(rel, f'{L.course} › {L.module_title} › {clean_title(L.lesson_title)}')}")
-        fm = {"vault_schema": VAULT_SCHEMA, "title": c, "type": "concept",
-              "tags": ["concept"], "lesson_count": len(ls)}
+            lines.append(
+                f"- {wikilink(rel, f'{L.course} › {L.module_title} › {clean_title(L.lesson_title)}')}"
+            )
+        fm = {
+            "vault_schema": VAULT_SCHEMA,
+            "title": c,
+            "type": "concept",
+            "tags": ["concept"],
+            "lesson_count": len(ls),
+        }
         moc_files.append((cpath, dump_frontmatter(fm) + "\n" + "\n".join(lines) + "\n"))
 
     # Persist
@@ -1007,8 +1304,15 @@ def git_init(vault_root: Path, dry_run: bool) -> None:
     r = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=vault_root)
     if r.returncode != 0:
         subprocess.run(
-            ["git", "commit", "-q", "-m", "vault: build obsidian structure (MOCs, nav, tags)"],
-            cwd=vault_root, check=True,
+            [
+                "git",
+                "commit",
+                "-q",
+                "-m",
+                "vault: build obsidian structure (MOCs, nav, tags)",
+            ],
+            cwd=vault_root,
+            check=True,
         )
         print("  committed vault snapshot")
     else:
@@ -1039,7 +1343,15 @@ Return STRICT JSON, no prose, no code fences:
 """
 
 
-def _collect_vault_inventory(vault_root: Path) -> tuple[dict[str, list[Path]], dict[str, int], dict[str, list[Path]], dict[str, int], list[Path]]:
+def _collect_vault_inventory(
+    vault_root: Path,
+) -> tuple[
+    dict[str, list[Path]],
+    dict[str, int],
+    dict[str, list[Path]],
+    dict[str, int],
+    list[Path],
+]:
     """Walk the vault, parse frontmatter of every lesson file.
 
     Returns (concept_to_paths, concept_counts, tag_to_paths, tag_counts, lesson_files).
@@ -1062,8 +1374,12 @@ def _collect_vault_inventory(vault_root: Path) -> tuple[dict[str, list[Path]], d
         if fm.get("vault_schema") != VAULT_SCHEMA:
             continue
         # Skip MOCs — only count true lesson notes for dedupe and inventory.
-        if fm.get("type") in ("module-moc", "course-moc", "vault-root", "concept") \
-                or fm.get("moc_type"):
+        if fm.get("type") in (
+            "module-moc",
+            "course-moc",
+            "vault-root",
+            "concept",
+        ) or fm.get("moc_type"):
             continue
         # Dedupe by lesson_id (defense-in-depth against vault duplication).
         lid = fm.get("lesson_id") or fm.get("lessonId")
@@ -1089,9 +1405,17 @@ def _collect_vault_inventory(vault_root: Path) -> tuple[dict[str, list[Path]], d
     return concept_paths, concept_counts, tag_paths, tag_counts, lesson_files
 
 
-def _build_canon_prompt(concept_counts: dict[str, int], tag_counts: dict[str, int]) -> str:
-    concept_lines = [f"  {c!r}: {n}" for c, n in sorted(concept_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
-    tag_lines = [f"  {t!r}: {n}" for t, n in sorted(tag_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+def _build_canon_prompt(
+    concept_counts: dict[str, int], tag_counts: dict[str, int]
+) -> str:
+    concept_lines = [
+        f"  {c!r}: {n}"
+        for c, n in sorted(concept_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    tag_lines = [
+        f"  {t!r}: {n}"
+        for t, n in sorted(tag_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
     return (
         "VAULT CONCEPT INVENTORY (name: occurrences across lessons):\n"
         + "\n".join(concept_lines)
@@ -1125,6 +1449,7 @@ def _canon_call_sdk(user_msg: str) -> str:
 
 def _canon_call_api(user_msg: str) -> str:
     import anthropic
+
     client = anthropic.Anthropic()
     extra_headers = {}
     if CANON_API_BETA_1M:
@@ -1136,13 +1461,16 @@ def _canon_call_api(user_msg: str) -> str:
         messages=[{"role": "user", "content": user_msg}],
         extra_headers=extra_headers or None,
     )
-    return resp.content[0].text
+    return str(getattr(resp.content[0], "text", ""))
 
 
 def _canon_call_local(user_msg: str) -> str:
     import requests
+
     if not LOCAL_LLM_BASE_URL or not LOCAL_LLM_MODEL:
-        raise RuntimeError("canon backend=local but LOCAL_LLM_BASE_URL / LOCAL_LLM_MODEL are not set")
+        raise RuntimeError(
+            "canon backend=local but LOCAL_LLM_BASE_URL / LOCAL_LLM_MODEL are not set"
+        )
     payload: dict[str, Any] = {
         "model": LOCAL_LLM_MODEL,
         "messages": [
@@ -1154,7 +1482,11 @@ def _canon_call_local(user_msg: str) -> str:
     }
     if LOCAL_LLM_DISABLE_THINKING:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
-    r = requests.post(f"{LOCAL_LLM_BASE_URL}/chat/completions", json=payload, timeout=LOCAL_LLM_TIMEOUT)
+    r = requests.post(
+        f"{LOCAL_LLM_BASE_URL}/chat/completions",
+        json=payload,
+        timeout=LOCAL_LLM_TIMEOUT,
+    )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
@@ -1166,7 +1498,10 @@ def _parse_canon_mapping(raw: str) -> dict:
     m = re.search(r"\{.*\}", t, re.DOTALL)
     if m:
         t = m.group(0)
-    data = json.loads(t)
+    try:
+        data = json.loads(t)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"invalid canonicalization JSON: {e}") from e
     out = {"concepts": {}, "tags": {}, "notes": str(data.get("notes", ""))[:600]}
     for k in ("concepts", "tags"):
         raw_map = data.get(k, {}) or {}
@@ -1180,7 +1515,9 @@ def _parse_canon_mapping(raw: str) -> dict:
     return out
 
 
-def _apply_canon_to_vault(lesson_files: list[Path], mapping: dict, dry_run: bool) -> dict[str, int]:
+def _apply_canon_to_vault(
+    lesson_files: list[Path], mapping: dict, dry_run: bool
+) -> dict[str, int]:
     """Rewrite frontmatter of every lesson file using the mapping.
 
     Returns a stats dict. Preserves body_sha so classification cache still hits.
@@ -1226,7 +1563,9 @@ def _apply_canon_to_vault(lesson_files: list[Path], mapping: dict, dry_run: bool
     return stats
 
 
-def _canon_commit(vault_root: Path, backend_label: str, stats: dict, mapping_path: Path) -> None:
+def _canon_commit(
+    vault_root: Path, backend_label: str, stats: dict, mapping_path: Path
+) -> None:
     if not (vault_root / ".git").exists():
         print("  vault is not a git repo — skipping auto-commit (changes are on disk)")
         return
@@ -1245,21 +1584,42 @@ def _canon_commit(vault_root: Path, backend_label: str, stats: dict, mapping_pat
         f"mapping: {mapping_path.name}"
     )
     subprocess.run(
-        ["git", "-c", "user.email=vault@local", "-c", "user.name=vault",
-         "commit", "-q", "-m", msg],
-        cwd=vault_root, check=True,
+        [
+            "git",
+            "-c",
+            "user.email=vault@local",
+            "-c",
+            "user.name=vault",
+            "commit",
+            "-q",
+            "-m",
+            msg,
+        ],
+        cwd=vault_root,
+        check=True,
     )
     print("  committed canonicalization snapshot")
 
 
 def run_canonicalize(vault_root: Path, backend: str, apply: bool) -> int:
-    print(f"canonicalize: vault={vault_root}  backend={backend}  model={CANON_MODEL}  apply={apply}")
-    concept_paths, concept_counts, tag_paths, tag_counts, lesson_files = _collect_vault_inventory(vault_root)
+    print(
+        f"canonicalize: vault={vault_root}  backend={backend}  model={CANON_MODEL}  apply={apply}"
+    )
+    concept_paths, concept_counts, tag_paths, tag_counts, lesson_files = (
+        _collect_vault_inventory(vault_root)
+    )
     print(f"  scanned {len(lesson_files)} lessons")
-    print(f"  unique concepts: {len(concept_counts)} (total occurrences: {sum(concept_counts.values())})")
-    print(f"  unique tags:     {len(tag_counts)} (total occurrences: {sum(tag_counts.values())})")
+    print(
+        f"  unique concepts: {len(concept_counts)} (total occurrences: {sum(concept_counts.values())})"
+    )
+    print(
+        f"  unique tags:     {len(tag_counts)} (total occurrences: {sum(tag_counts.values())})"
+    )
     if not lesson_files:
-        print("  no lessons found with vault_schema frontmatter; nothing to canonicalize", file=sys.stderr)
+        print(
+            "  no lessons found with vault_schema frontmatter; nothing to canonicalize",
+            file=sys.stderr,
+        )
         return 1
 
     user_msg = _build_canon_prompt(concept_counts, tag_counts)
@@ -1299,7 +1659,9 @@ def run_canonicalize(vault_root: Path, backend: str, apply: bool) -> int:
     notes_dir = vault_root / ".vault-notes"
     notes_dir.mkdir(parents=True, exist_ok=True)
     mapping_path = notes_dir / "canonicalize-mapping.json"
-    mapping_path.write_text(json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8")
+    mapping_path.write_text(
+        json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     print(f"  wrote mapping: {mapping_path}")
 
     if not apply:
@@ -1312,7 +1674,9 @@ def run_canonicalize(vault_root: Path, backend: str, apply: bool) -> int:
         return 0
 
     stats = _apply_canon_to_vault(lesson_files, mapping, dry_run=False)
-    print(f"  applied: files_changed={stats['files_changed']} concept_replacements={stats['concept_replacements']} tag_replacements={stats['tag_replacements']}")
+    print(
+        f"  applied: files_changed={stats['files_changed']} concept_replacements={stats['concept_replacements']} tag_replacements={stats['tag_replacements']}"
+    )
     _canon_commit(vault_root, f"{backend}/{CANON_MODEL}", stats, mapping_path)
     return 0
 
@@ -1325,34 +1689,69 @@ def main() -> int:
     ap.add_argument("root", type=Path, help="e.g. downloads/makerschool")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--force", action="store_true", help="re-call Haiku even if body_sha matches")
-    ap.add_argument("--no-ai", action="store_true", help="skip Haiku (structural pass only)")
-    ap.add_argument("--concurrency", type=int, default=4, help="Concurrent sdk/api calls")
-    ap.add_argument("--local-concurrency", type=int, default=2,
-                    help="Concurrent calls to the local LLM server (keep low on single-GPU hosts)")
-    ap.add_argument("--backend", choices=["auto", "sdk", "api", "local", "hybrid"], default="auto",
-                    help="auto = api if ANTHROPIC_API_KEY set, else sdk. "
-                         "local = OpenAI-compatible server (LOCAL_LLM_* env). "
-                         "hybrid = Haiku for technical paths (--haiku-paths), local for the rest.")
-    ap.add_argument("--haiku-paths", default=",".join(DEFAULT_HAIKU_PATH_GLOBS),
-                    help="Comma-separated fnmatch globs matched against course/module/title; used only by --backend hybrid")
+    ap.add_argument(
+        "--force", action="store_true", help="re-call Haiku even if body_sha matches"
+    )
+    ap.add_argument(
+        "--no-ai", action="store_true", help="skip Haiku (structural pass only)"
+    )
+    ap.add_argument(
+        "--concurrency", type=int, default=4, help="Concurrent sdk/api calls"
+    )
+    ap.add_argument(
+        "--local-concurrency",
+        type=int,
+        default=2,
+        help="Concurrent calls to the local LLM server (keep low on single-GPU hosts)",
+    )
+    ap.add_argument(
+        "--backend",
+        choices=["auto", "sdk", "api", "local", "codex", "hybrid"],
+        default="auto",
+        help="auto = api if ANTHROPIC_API_KEY set, else sdk. "
+        "sdk uses Claude CLI and falls back via AI_FALLBACK_BACKENDS (default: codex). "
+        "codex = Codex CLI fallback. local = OpenAI-compatible server (LOCAL_LLM_* env). "
+        "hybrid = Haiku for technical paths (--haiku-paths), local for the rest.",
+    )
+    ap.add_argument(
+        "--haiku-paths",
+        default=",".join(DEFAULT_HAIKU_PATH_GLOBS),
+        help="Comma-separated fnmatch globs matched against course/module/title; used only by --backend hybrid",
+    )
     ap.add_argument("--git-init", action="store_true")
-    ap.add_argument("--canonicalize", action="store_true",
-                    help="Run a one-shot dedup pass on the existing vault — no re-classification. "
-                         "Sends the full tag+concept inventory to CANON_MODEL and applies the resulting mapping.")
-    ap.add_argument("--canon-apply", action="store_true",
-                    help="With --canonicalize: actually rewrite frontmatters + git commit. Without it: dry-run, print sample + write mapping JSON.")
-    ap.add_argument("--canon-backend", choices=["sdk", "api", "local"], default=None,
-                    help="Override CANON_BACKEND env for this run.")
-    ap.add_argument("--course-from-section", dest="course_from_section",
-                    action="store_true", default=True,
-                    help="Derive the lesson `course:` frontmatter field from the section folder "
-                         "name (immediate child of vault_root). Default ON. Required when the vault "
-                         "is flat (Month 1/, Month 2/, ... directly under vault_root).")
-    ap.add_argument("--no-course-from-section", dest="course_from_section",
-                    action="store_false",
-                    help="Legacy mode: hard-code `course:` to vault_root folder name "
-                         "(e.g. 'Maker School') for vaults still nested under one top-level wrapper.")
+    ap.add_argument(
+        "--canonicalize",
+        action="store_true",
+        help="Run a one-shot dedup pass on the existing vault — no re-classification. "
+        "Sends the full tag+concept inventory to CANON_MODEL and applies the resulting mapping.",
+    )
+    ap.add_argument(
+        "--canon-apply",
+        action="store_true",
+        help="With --canonicalize: actually rewrite frontmatters + git commit. Without it: dry-run, print sample + write mapping JSON.",
+    )
+    ap.add_argument(
+        "--canon-backend",
+        choices=["sdk", "api", "local"],
+        default=None,
+        help="Override CANON_BACKEND env for this run.",
+    )
+    ap.add_argument(
+        "--course-from-section",
+        dest="course_from_section",
+        action="store_true",
+        default=True,
+        help="Derive the lesson `course:` frontmatter field from the section folder "
+        "name (immediate child of vault_root). Default ON. Required when the vault "
+        "is flat (Month 1/, Month 2/, ... directly under vault_root).",
+    )
+    ap.add_argument(
+        "--no-course-from-section",
+        dest="course_from_section",
+        action="store_false",
+        help="Legacy mode: hard-code `course:` to vault_root folder name "
+        "(e.g. 'Maker School') for vaults still nested under one top-level wrapper.",
+    )
     args = ap.parse_args()
 
     vault_root = args.root.resolve()
@@ -1399,11 +1798,17 @@ def main() -> int:
     # Phase 1: enrich (AI) + compute new_path
     print("enriching transcripts ...")
     import asyncio
-    asyncio.run(run_async_enrichment(
-        lessons, args.force, mode=backend,
-        sdk_concurrency=args.concurrency, local_concurrency=args.local_concurrency,
-        haiku_globs=haiku_globs,
-    ))
+
+    asyncio.run(
+        run_async_enrichment(
+            lessons,
+            args.force,
+            mode=backend,
+            sdk_concurrency=args.concurrency,
+            local_concurrency=args.local_concurrency,
+            haiku_globs=haiku_globs,
+        )
+    )
     for L in lessons:
         _finalize_filename(L)
 
@@ -1424,7 +1829,11 @@ def main() -> int:
         tmp.write_text(content, encoding="utf-8")
         tmp.replace(new_path)
         # delete the old transcript.md if it differs from new_path
-        if L.transcript_path and L.transcript_path.exists() and L.transcript_path.resolve() != new_path.resolve():
+        if (
+            L.transcript_path
+            and L.transcript_path.exists()
+            and L.transcript_path.resolve() != new_path.resolve()
+        ):
             L.transcript_path.unlink()
             renamed += 1
     print(f"  rendered {len(lessons)} lessons, renamed {renamed} originals")
