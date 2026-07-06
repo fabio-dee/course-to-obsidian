@@ -43,10 +43,32 @@ def extract_html_body_chars(index_html: Path) -> int:
     return len(re.sub(r"\s+", " ", text).strip())
 
 
+def extract_lesson_id(md_path: Path) -> str | None:
+    """Pull `lesson_id:` from YAML frontmatter without requiring pyyaml."""
+    try:
+        text = md_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    if not text.startswith("---\n"):
+        return None
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return None
+    fm = text[4:end]
+    m = re.search(r"(?m)^lesson_id:\s*['\"]?([^'\"\n]+?)['\"]?\s*$", fm)
+    return m.group(1).strip() if m else None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("root", type=Path)
     ap.add_argument("--failures", type=Path, help="path to ai-failures.md")
+    ap.add_argument(
+        "--dedupe-by-lesson-id",
+        action="store_true",
+        help="aggregate by frontmatter lesson_id instead of file path "
+             "(integrity check for duplication bugs; warns on collisions)",
+    )
     args = ap.parse_args()
 
     fail_titles: set[str] = set()
@@ -56,7 +78,21 @@ def main() -> None:
                 fail_titles.add(line[2:].strip())
 
     rows: list[tuple[int, int, int, bool, str]] = []   # (combined_chars, transcript_chars, html_chars, failed, label)
+    seen_ids: dict[str, str] = {}     # lesson_id -> first path that claimed it
+    dupe_skipped = 0
+    raw_count = 0
     for lesson_md in args.root.rglob("[0-9][0-9]. *.md"):
+        raw_count += 1
+        if args.dedupe_by_lesson_id:
+            lid = extract_lesson_id(lesson_md)
+            if lid:
+                if lid in seen_ids:
+                    print(f"  ⚠️  duplicate lesson_id={lid}")
+                    print(f"       kept: {seen_ids[lid]}")
+                    print(f"       skip: {lesson_md.relative_to(args.root)}")
+                    dupe_skipped += 1
+                    continue
+                seen_ids[lid] = str(lesson_md.relative_to(args.root))
         lesson_dir = lesson_md.parent
         idx = lesson_dir / "index.html"
         t_chars = len(extract_transcript_body(lesson_md))
@@ -66,6 +102,11 @@ def main() -> None:
         title = re.sub(r"^\d+\.\s*", "", lesson_md.stem)
         failed = title in fail_titles
         rows.append((combined, t_chars, h_chars, failed, str(lesson_md.relative_to(args.root))))
+
+    if args.dedupe_by_lesson_id:
+        unique = len(rows)
+        print(f"\nDeduped: {raw_count} file paths → {unique} unique lessons "
+              f"({dupe_skipped} dupes skipped)")
 
     rows.sort(reverse=True)
     combined_all = [r[0] for r in rows]
