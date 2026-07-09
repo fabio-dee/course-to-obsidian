@@ -74,6 +74,9 @@ LOCAL_LLM_TIMEOUT = float(os.environ.get("LOCAL_LLM_TIMEOUT", "900"))
 CODEX_CLI = os.environ.get("CODEX_CLI", "codex")
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "")
 CODEX_CLI_TIMEOUT = float(os.environ.get("CODEX_CLI_TIMEOUT", "900"))
+# Per-attempt cap on the Claude SDK classify call so a hung Claude CLI process
+# fails fast and reaches AI_FALLBACK_BACKENDS instead of stalling the build.
+SDK_CLASSIFY_TIMEOUT = float(os.environ.get("SDK_CLASSIFY_TIMEOUT", "120"))
 AI_FALLBACK_BACKENDS = tuple(
     b.strip()
     for b in os.environ.get("AI_FALLBACK_BACKENDS", "codex").split(",")
@@ -128,7 +131,7 @@ class Lesson:
     new_filename: str = ""  # e.g. "01. Choose operating name.md"
     new_path: Path = field(default=Path())
     body_hash: str = ""
-    ai: dict = field(default_factory=dict)  # {summary, tags, concepts, aliases}
+    ai: dict = field(default_factory=dict)  # {summary, tags, concepts, aliases, engine?}
     prev: "Lesson | None" = None
     next: "Lesson | None" = None
 
@@ -436,7 +439,9 @@ def haiku_classify_api(client, title: str, path_hint: str, body: str) -> dict:
                 ],
                 messages=[{"role": "user", "content": user_msg}],
             )
-            return _parse_classification_text(resp.content[0].text)
+            ai = _parse_classification_text(resp.content[0].text)
+            ai["engine"] = "claude-api"
+            return ai
         except (
             anthropic.APIError,
             json.JSONDecodeError,
@@ -505,7 +510,9 @@ def classify_local_api(title: str, path_hint: str, body: str) -> dict:
                 raise ValueError(
                     "empty content (model may have exhausted max_tokens on reasoning)"
                 )
-            return _parse_classification_text(raw)
+            ai = _parse_classification_text(raw)
+            ai["engine"] = "local"
+            return ai
         except Exception as e:
             if attempt == 2:
                 print(
@@ -613,7 +620,9 @@ def classify_codex_cli(title: str, path_hint: str, body: str) -> dict:
             )
         if not raw:
             raise ValueError("empty response from codex")
-        return _parse_classification_text(raw)
+        ai = _parse_classification_text(raw)
+        ai["engine"] = "codex"
+        return ai
     except Exception as e:
         print(f"  codex(cli) failed ({e}) for {title}", file=sys.stderr)
         return _empty_ai()
@@ -638,18 +647,25 @@ async def haiku_classify_sdk(title: str, path_hint: str, body: str) -> dict:
         max_turns=1,
     )
     user_msg = _build_user_msg(title, path_hint, body)
+
+    async def _collect() -> str:
+        text = ""
+        async for msg in query(prompt=user_msg, options=opts):
+            if isinstance(msg, AssistantMessage):
+                for b in msg.content:
+                    if isinstance(b, TextBlock):
+                        text += b.text
+        return text
+
     last_err: Exception | None = None
     for attempt in range(5):
         try:
-            text = ""
-            async for msg in query(prompt=user_msg, options=opts):
-                if isinstance(msg, AssistantMessage):
-                    for b in msg.content:
-                        if isinstance(b, TextBlock):
-                            text += b.text
+            text = await asyncio.wait_for(_collect(), timeout=SDK_CLASSIFY_TIMEOUT)
             if not text.strip():
                 raise ValueError("empty response from CLI")
-            return _parse_classification_text(text)
+            ai = _parse_classification_text(text)
+            ai["engine"] = "claude-sdk"
+            return ai
         except Exception as e:  # SDK raises bare Exception on CLI exit!=0
             last_err = e
             if attempt < 4:
@@ -974,6 +990,11 @@ def render_lesson(
         "concepts": L.ai.get("concepts", []),
         "body_sha": L.body_hash,
     }
+    # Record which engine produced the classification (claude-sdk | codex |
+    # claude-api | local); carried forward from existing frontmatter on cache hits.
+    ai_engine = L.ai.get("engine") or fm.get("ai_engine")
+    if ai_engine:
+        new_fm["ai_engine"] = ai_engine
     # carry forward transcription provenance if present
     for k in (
         "source",
