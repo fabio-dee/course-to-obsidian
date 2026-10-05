@@ -316,13 +316,34 @@ def find_videos(root: Path, filename: str) -> list[Path]:
     """
     Walk root recursively and return all paths matching filename,
     sorted by their string representation for deterministic ordering.
+    filename may be a comma-separated preference list
+    (e.g. "video.mp4,video.hevc.mp4"): one video per dir, first match wins.
     """
+    names = [n.strip() for n in filename.split(",") if n.strip()]
     found = []
     for dirpath, _dirs, files in os.walk(root):
-        if filename in files:
-            found.append(Path(dirpath) / filename)
+        match = next((n for n in names if n in files), None)
+        if match:
+            found.append(Path(dirpath) / match)
     found.sort(key=lambda p: str(p))
     return found
+
+
+def has_transcript_note(lesson_dir: Path, output_name: str) -> bool:
+    """
+    True when the vault builder already merged a transcript into the lesson
+    note. The builder renames transcript.md into "NN. Title.md" with a
+    "## Transcript" section, so transcript.md alone is not a reliable signal.
+    """
+    for note in lesson_dir.glob("*.md"):
+        if note.name == output_name:
+            continue
+        try:
+            if "## Transcript" in note.read_text(encoding="utf-8", errors="ignore"):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -726,7 +747,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--filename",
         default="video.mp4",
-        help="Video filename to match (default: video.mp4)",
+        help=(
+            "Video filename to match (default: video.mp4). Comma-separated list = "
+            "preference order, one video per lesson dir (e.g. video.mp4,video.hevc.mp4)."
+        ),
     )
     p.add_argument(
         "--output",
@@ -737,6 +761,14 @@ def parse_args() -> argparse.Namespace:
         "--force",
         action="store_true",
         help="Re-transcribe even if transcript already exists.",
+    )
+    p.add_argument(
+        "--include-noted",
+        action="store_true",
+        help=(
+            "Also transcribe lessons whose note already holds a '## Transcript' "
+            "section (skipped by default; the vault builder consumes transcript.md)."
+        ),
     )
     p.add_argument(
         "--resume",
@@ -820,7 +852,10 @@ def main() -> int:
     skipped = 0
     for vp in videos_to_consider:
         transcript_path = vp.parent / args.output
-        if transcript_path.exists() and not args.force:
+        if not args.force and (
+            transcript_path.exists()
+            or (not args.include_noted and has_transcript_note(vp.parent, args.output))
+        ):
             skipped += 1
         else:
             pending.append(vp)
