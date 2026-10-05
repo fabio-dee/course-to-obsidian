@@ -22,6 +22,9 @@ BACKEND:
              CTC/TDT decoder, architecturally immune to repetition-loop
              hallucinations, English-only.
     Fallback: --backend whisper — uses mlx-whisper (requires Python 3.9 venv).
+    Linux/x86: --backend onnx — same Parakeet-TDT-0.6B-v3 model via onnx-asr
+             on CPU (int8, Silero VAD segments), ~11× real-time on a Ryzen 7.
+             pip install "onnx-asr[cpu,hub]"
 """
 
 import argparse
@@ -540,6 +543,100 @@ def transcribe_one_whisper(
 
 
 # ---------------------------------------------------------------------------
+# Core transcription — onnx backend (Linux / x86 CPU)
+# ---------------------------------------------------------------------------
+
+ONNX_DEFAULT_MODEL = "nemo-parakeet-tdt-0.6b-v3"
+
+# Module-level cache: (model_id) -> VAD-wrapped recognizer
+_onnx_model_cache: dict = {}
+
+
+def import_onnx_asr():
+    """Import onnx_asr or abort with clear instructions."""
+    try:
+        import onnx_asr  # noqa: PLC0415
+        return onnx_asr
+    except ImportError:
+        print(
+            "ERROR: onnx_asr is not installed.\n"
+            '  pip install "onnx-asr[cpu,hub]"',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def transcribe_one_onnx(
+    video_path: Path,
+    output_name: str,
+    model_id: str,
+    language: Optional[str],
+    onnx_asr,
+    index: int,
+    total: int,
+) -> tuple[bool, str]:
+    """
+    Transcribe a single video with Parakeet-TDT via onnx-asr (CPU).
+    Audio is extracted to a 16 kHz mono WAV first; Silero VAD splits it into
+    segments with .start/.end/.text, which build_paragraphs() consumes.
+    Returns (success, message). On failure writes a .FAILED sentinel.
+    """
+    import tempfile  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    transcript_path = video_path.parent / output_name
+    wall_start = time.monotonic()
+
+    try:
+        if model_id not in _onnx_model_cache:
+            print(f"  Loading model {model_id} (onnx, int8)…", flush=True)
+            model = onnx_asr.load_model(model_id, quantization="int8")
+            _onnx_model_cache[model_id] = model.with_vad(onnx_asr.load_vad("silero"))
+        recognizer = _onnx_model_cache[model_id]
+
+        with tempfile.TemporaryDirectory(prefix="tx-onnx-") as tmp:
+            wav = Path(tmp) / "audio.wav"
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-i", str(video_path),
+                 "-vn", "-ac", "1", "-ar", "16000", str(wav)],
+                check=True, capture_output=True, text=True,
+            )
+            segments = [s for s in recognizer.recognize(str(wav)) if s.text.strip()]
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
+        write_failed_sentinel(transcript_path, error_msg)
+        return False, f"FAILED: {type(exc).__name__}: {exc}"
+
+    wall_elapsed = time.monotonic() - wall_start
+
+    text = " ".join(s.text.strip() for s in segments)
+    duration_sec = int(segments[-1].end) if segments else 0
+    word_count = len(text.split()) if text else 0
+
+    metadata = read_lesson_metadata(video_path.parent)
+
+    content = build_transcript_markdown(
+        video_path=video_path,
+        text=text,
+        segments=segments,
+        metadata=metadata,
+        model=model_id,
+        language=language if language else "en",
+        backend="local-parakeet-onnx",
+    )
+
+    write_atomic(transcript_path, content)
+
+    rel = video_path.relative_to(video_path.parents[2]) if len(video_path.parts) >= 3 else video_path
+    rtf = (duration_sec / wall_elapsed) if wall_elapsed > 0 else 0
+    msg = (
+        f"[{index}/{total}] {rel} → {output_name} "
+        f"({duration_sec}s audio, {wall_elapsed:.0f}s wall, {rtf:.0f}× RT, {word_count} words)"
+    )
+    return True, msg
+
+
+# ---------------------------------------------------------------------------
 # Unified dispatch
 # ---------------------------------------------------------------------------
 
@@ -554,8 +651,19 @@ def transcribe_one(
     mlx_whisper,
     index: int,
     total: int,
+    onnx_asr=None,
 ) -> tuple[bool, str]:
     """Dispatch to the appropriate backend."""
+    if backend == "onnx":
+        return transcribe_one_onnx(
+            video_path=video_path,
+            output_name=output_name,
+            model_id=model,
+            language=language,
+            onnx_asr=onnx_asr,
+            index=index,
+            total=total,
+        )
     if backend == "parakeet":
         return transcribe_one_parakeet(
             video_path=video_path,
@@ -594,13 +702,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("root", help="Root directory to walk for video files.")
     p.add_argument(
         "--backend",
-        choices=["parakeet", "whisper"],
+        choices=["parakeet", "whisper", "onnx"],
         default="parakeet",
         help=(
             "Transcription backend. 'parakeet' (default): NVIDIA Parakeet-TDT-0.6B-v3 "
             "via parakeet-mlx — ~60× real-time, English-only, CTC/TDT decoder (no repetition "
             "loops). 'whisper': mlx-whisper fallback — multilingual but prone to hallucination "
-            "loops on silence."
+            "loops on silence. 'onnx': same Parakeet model via onnx-asr on CPU, for "
+            "Linux/x86 hosts without Apple Silicon (model defaults to "
+            f"{ONNX_DEFAULT_MODEL})."
         ),
     )
     p.add_argument(
@@ -671,10 +781,16 @@ def main() -> int:
 
     from_pretrained_fn = None
     mlx_whisper = None
+    onnx_asr = None
+
+    if args.backend == "onnx" and args.model == "mlx-community/parakeet-tdt-0.6b-v3":
+        args.model = ONNX_DEFAULT_MODEL
 
     if not args.dry_run:
         if args.backend == "parakeet":
             from_pretrained_fn = import_parakeet()
+        elif args.backend == "onnx":
+            onnx_asr = import_onnx_asr()
         else:
             mlx_whisper = import_mlx_whisper()
 
@@ -784,6 +900,7 @@ def main() -> int:
                 mlx_whisper=mlx_whisper,
                 index=display_index,
                 total=global_total,
+                onnx_asr=onnx_asr,
             )
 
             if success:
